@@ -1,0 +1,68 @@
+---
+description: Drift checks MUST always include the standard Name field (type + displayFormat), not just custom __c fields
+alwaysApply: true
+---
+
+# Attribute Drift MUST Always Include the Standard `Name` Field (MANDATORY)
+
+Every attribute-drift check (`sf-deploy-delta-and-blockers.mdc` STEP 2 §3b,
+`attr_drift.py`) MUST compare the object's **standard `Name` field** — its
+**type** (`Text` vs `AutoNumber`) and, for AutoNumber, its **`displayFormat`** —
+between the SHEET and the ORG, on EVERY run. The `Name` field is a real,
+client-specified field on the sheet and drifts exactly like any custom field, but
+because it is NOT a `__c` custom field it was previously invisible to the drift
+tool. This is no longer optional: a drift run that does not report `Name` is
+INCOMPLETE.
+
+## Why this rule exists (real incident, 2026-09-09)
+
+`attr_drift.py` filtered rows with `if not api.endswith("__c"): continue` and read
+only the CustomObject `<fields>` block — so the standard `Name` field was never
+compared. As a result **`TI_Fnt_Receiving__c`** and **`TI_Fnt_ReceivingDetail__c`**
+shipped with `Name = Text` while the sheet declared **AutoNumber** with display
+formats `RCV{0000000}` / `RCD{0000000}`. The drift check reported
+`drifted: 0` and the mismatch went undetected until the user questioned it. A
+name-only or custom-only drift check is a false "all clear".
+
+## What the check MUST do (every object, every run)
+
+1. **Read the sheet's declared Name-field definition** from the object-meta row
+   (header-driven): `Name Field Type` and `Name Field Display Format` (and
+   `Name Field Label` when present). Read it LIVE (`read-sheet-live.mdc`).
+2. **Read the org's actual Name-field metadata** from the CustomObject
+   `<nameField>` block via the Metadata API `readMetadata(CustomObject)`
+   (FLS-independent) — NOT `sobject describe`. Capture `type` + `displayFormat`.
+3. **Compare and report as drift** when either differs:
+   - `type`: sheet (`Text`/`AutoNumber`) vs org, case-insensitive.
+   - `displayFormat`: compared ONLY when the sheet type is `AutoNumber` and a
+     format is given (e.g. sheet `RCV{0000000}` vs org empty).
+   Surface it in the drift table as field `Name` with a `STANDARD Name field; …`
+   reason, and count it toward `drifted` (never silently in-sync).
+4. **Never auto-redeploy the Name drift.** Changing `Name` from `Text` to
+   `AutoNumber` OVERWRITES every existing record's Name with a generated value —
+   it is destructive to existing data. Report it, then get explicit user approval
+   (per `sf-deploy-delta-and-blockers.mdc`) before deploying the CustomObject
+   `nameField` change.
+
+## Implementation (already wired — keep it wired)
+
+- `attr_drift.py::read_org_object` captures `org["__nameField__"] = {type,
+  displayFormat, label}` from the CustomObject `<nameField>` block.
+- `attr_drift.py::main` locates the sheet object-meta row (by `Name Field Type` /
+  `Name Field Display Format`) and emits a `Name` drift entry when type or
+  (AutoNumber) displayFormat differ. If the object-meta row or the org
+  `<nameField>` is missing, it prints a WARNING that Name drift was NOT checked
+  rather than silently passing.
+- `prep_deploy.py` runs `attr_drift.py` in its build phase, so this Name check
+  runs automatically for every existing object.
+
+## Guardrails
+
+- A drift run that skips `Name` (custom-only) is INCOMPLETE — treat a missing
+  Name comparison as a red gate, not a pass.
+- All reads are LIVE and FLS-independent (Metadata API for the org `nameField`,
+  the sheet object-meta row for the intended definition).
+- The Name-field fix is DESTRUCTIVE to existing record Names — never auto-deploy
+  it; require explicit user approval first.
+- This rule complements, and does not replace, the custom-field attribute-drift
+  requirements in `sf-deploy-delta-and-blockers.mdc`.

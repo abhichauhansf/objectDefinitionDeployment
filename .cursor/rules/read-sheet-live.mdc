@@ -1,0 +1,47 @@
+---
+description: Whenever sheet data is needed, read it LIVE from the Google Sheet via the API. Never answer from cached/local snapshots (whole_sheet.json, temp_updates.json, prior extracts). Applies to every analysis, lookup, glossary/field-naming, validation, or preview step that consumes sheet content.
+alwaysApply: true
+---
+
+# Always Read Sheet Data Live From the Google Sheet (MANDATORY)
+
+The Google Sheet is the single source of truth. Whenever a task needs sheet
+content (cell values, field labels, tab lists, existing API names, etc.), fetch
+it **live from the Google Sheet via the Sheets API at that moment**. Do not rely
+on any previously saved copy.
+
+## Never read from cached / stale sources
+
+Treat these as NOT authoritative and do not use them to answer or drive a task,
+even if they exist and look complete:
+- Local snapshots such as `.build/whole_sheet.json`, `.build/whole_report.json`,
+  `.build/temp_updates.json`, or any earlier export.
+- Data remembered from earlier in the conversation.
+- Screenshots or pasted excerpts (use only as a hint; still fetch live to act).
+
+If such a file already exists, ignore it as a data source and re-fetch. You may
+overwrite it with a fresh live pull, but the live fetch must happen first.
+
+## Required flow whenever sheet data is needed
+
+1. Identify the spreadsheet ID and the exact tab(s) required.
+2. Fetch that data live from the Google Sheet API right now (a fresh call).
+3. Use only that freshly fetched data for the analysis/lookup/proposal.
+4. If you just fetched moments ago in the same turn for the same range, you may
+   reuse that in-turn result; otherwise fetch again.
+
+## Interaction with other rules
+
+- This rule governs READS only and does not authorize any write. Writing back to
+  the sheet still requires the sheet-write confirmation gate.
+- The scope-selection gate still applies: confirm which tab(s) to read before a
+  live fetch when the target is ambiguous.
+- Prefer the least data needed (specific tab/range) over pulling the whole
+  workbook, but always pull it live.
+
+## Guardrails
+
+- If a live fetch fails (auth/permission/network), STOP and report it — do not
+  silently fall back to a cached file.
+- Never present cached data as if it were current. If you cannot fetch live,
+  say so explicitly rather than answering from a stale snapshot.

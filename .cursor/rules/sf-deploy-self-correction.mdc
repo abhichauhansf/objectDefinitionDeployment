@@ -1,0 +1,99 @@
+---
+description: MANDATORY self-correction & continuous-improvement loop for the local Sheet→Salesforce deployment pipeline. Always applies. Every deployment/validation failure is auto-logged as a DRAFT lesson and MUST be completed (root cause + fix + prevention) before success is claimed. Also apply past lessons before every deploy.
+globs:
+alwaysApply: true
+---
+
+# Deployment Self-Correction & Error-Learning Loop (MANDATORY)
+
+Goal: every deployment/validation failure is analyzed, root-caused, fixed in the
+scripts, and recorded so it can NEVER silently recur. The memory lives in
+`.cursor/deployment_knowledge.md`.
+
+## Why this rule is always-applied (do not regress)
+
+This loop was silently skipped for an entire deploy series (see the 2026-08-25
+META lesson) because the rule was `alwaysApply: false` (never loaded) and the KB
+update was a manual, advisory step. It is now ALWAYS applied and the KB write is
+AUTOMATED so it cannot be forgotten.
+
+## MANDATORY quality gate — no failure without a lesson
+
+1. **Route every org-touching deploy through `scripts/deploy.py` /
+   `scripts/prep_deploy.py`.** Never hand-run `sf project deploy start` for the
+   real deploy path — the wrappers write `.build/last_deploy_failure.json` and
+   auto-append a DRAFT lesson on any non-zero exit. Ad-hoc `sf` calls bypass the
+   safety net (that is exactly how the gap happened).
+2. **On failure, a DRAFT lesson is auto-written** by `scripts/log_failure.py`
+   (invoked automatically from `deploy.py`). It carries `Status: DRAFT` with
+   `TODO` markers for Component / Category / Root cause / Fix / Prevention.
+3. **You MUST complete every DRAFT before claiming success.** Fill in the real
+   diagnosis + the two fixes (Step 3 below) and flip `Status:` from `DRAFT` to
+   `Resolved` (or `Monitoring`).
+4. **Gate check:** run `python scripts/log_failure.py --check`. It exits non-zero
+   while ANY `Status: DRAFT` lesson remains. A deploy is NOT "successful" — and
+   you must not report it as such — while the gate is red. `verify_deploy.py`
+   passing does not waive this.
+
+## Before deploying — apply past lessons
+
+Read `.cursor/deployment_knowledge.md` first. If the current change resembles a
+prior failure, verify the relevant prevention rule in `scripts/validate_sheet.py`
+still covers it before running any deploy.
+
+## On failure — run the loop
+
+Trigger whenever `scripts/deploy.py`, `sf project deploy start/validate`, or any
+pipeline script exits non-zero.
+
+### Step 1 — Capture failure context
+- `scripts/deploy.py` already writes `.build/last_deploy.log` (full output) and
+  `.build/last_deploy_failure.json` (timestamp, org, mode, extracted failures,
+  candidate error codes). Read both.
+- Identify the exact component (metadata type + API name), file/line, error code,
+  and any missing dependency.
+
+### Step 2 — Root Cause Analysis
+Classify the failure into one category and diagnose against Salesforce Metadata
+API rules:
+- **Schema/Type:** bad API name, illegal chars, missing/forbidden attribute,
+  wrong length/precision/scale, unsupported type.
+- **Dependency:** missing referenced field/object/profile/permission or parent.
+- **Order-of-Execution:** dependent metadata deployed before its parent →
+  fix `TYPE_ORDER` / manifest grouping in `scripts/build_manifest.py`.
+- **Environment/Org:** missing org feature, API-version mismatch, wrong target org.
+
+### Step 3 — Auto-correct scripts + validation (two fixes, always)
+1. **Fix the producer:** correct `scripts/generate_xml.py` (or the layout/
+   flexipage/permset generators) or `scripts/build_manifest.py` so the emitted
+   metadata / ordering / XML is correct.
+2. **Add a pre-deploy guard:** add or tighten a check in
+   `scripts/validate_sheet.py` (new entry in `RULES`, a new `rep.error(...)`
+   branch, or a constraint) so the SAME error is caught BEFORE deploy next time.
+   A failure without a new validation guard is not fully resolved.
+
+Keep `scripts/validate_sheet.py` aligned with
+`../sheet-editor/context/FIELD_TYPE_VALIDATION_RULES.md` and related specs; if a
+rule changes, update the spec too.
+
+### Step 4 — Complete the auto-logged lesson (self-learning memory)
+`scripts/log_failure.py` has ALREADY appended a `Status: DRAFT` skeleton to
+`.cursor/deployment_knowledge.md` (newest on top, deduped by failure signature).
+Do NOT create a second entry — EDIT that draft in place: fill Component, Category,
+Root cause, Fix applied, Prevention added, and flip `Status:` to `Resolved` (or
+`Monitoring`). If the failure came from a manual command that bypassed
+`deploy.py`, add the entry by hand using the format at the top of the KB file.
+Then run `python scripts/log_failure.py --check` and confirm it exits 0.
+
+## Guardrails
+- Never bypass the validation gate (`--skip-validation-gate`) to "make a deploy
+  pass". Fix the root cause instead.
+- Never delete or rewrite past knowledge-base entries; the file is append-only
+  (you may update an entry's **Status**: DRAFT → Resolved/Monitoring, or
+  Monitoring → Resolved).
+- Never report a deploy as successful while `scripts/log_failure.py --check`
+  exits non-zero (an unresolved `Status: DRAFT` lesson remains).
+- Never hand-run the REAL deploy (`sf project deploy start` without `--dry-run`)
+  outside `deploy.py`/`prep_deploy.py` — that skips the auto-log safety net.
+- Re-run `scripts/validate_sheet.py` after adding a guard to confirm it now
+  catches the case that failed.

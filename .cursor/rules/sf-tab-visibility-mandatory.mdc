@@ -1,0 +1,70 @@
+---
+description: Mandatory tab-visibility grant after any CustomTab creation
+alwaysApply: true
+---
+
+# Tab Visibility Grant is a MANDATORY Pipeline Step (never optional)
+
+Creating a `CustomTab` — and even adding it to a Lightning app — does **NOT** make
+the tab visible to users. Every new tab defaults to **OFF** on all
+profiles/permission sets until its visibility is EXPLICITLY granted. A tab the
+user cannot see is a broken deliverable. Therefore, whenever a `CustomTab` is
+created for an object, granting its visibility on the default permission set
+**`SalesFrontAdmin`** is an AUTOMATIC, MANDATORY step of the pipeline — exactly
+like the post-deploy FLS auto-grant (`sf-post-deploy-fls-and-flexipage.mdc`
+GATE 1). Do NOT ask whether to grant it; just grant it.
+
+This rule LAYERS ON TOP OF `sf-object-tab-and-app.mdc`: that rule governs WHEN a
+tab is created (object `H6` = TRUE); this rule governs the tab being made VISIBLE
+once it exists.
+
+## When this fires (every time)
+
+For EVERY `CustomTab` that gets created/deployed (single object AND every object
+in a multi-object deploy) whose sheet `H6` "Create Tab" flag is TRUE:
+
+1. After the tab is deployed and confirmed live
+   (`listMetadata CustomTab`), you MUST grant its visibility on `SalesFrontAdmin`
+   (or the user's explicitly-named alternative permission set) WITHOUT asking.
+2. This is part of the SAME flow as tab creation — never deferred, never left as
+   a "want me to?" question, never a manual App-Builder/Setup click.
+
+## How to grant (CLI-free, idempotent, verified)
+
+Use the helper — it inserts a Tooling `PermissionSetTabSetting` with
+`Visibility='DefaultOn'`, skips tabs already set, and verifies live:
+
+```
+python scripts/grant_tab_visibility.py --tabs <Obj>__c[,<Obj2>__c,...]
+# optional: --permset <Name>  (default SalesFrontAdmin)  |  --check (report only)
+```
+
+Notes:
+- The Tooling `PermissionSetTabSetting.Visibility` picklist is RESTRICTED — valid
+  values are **`DefaultOn` / `DefaultOff` / `Hidden`**. The Metadata-API words
+  `Visible`/`Available` are REJECTED (`INVALID_OR_NULL_FOR_RESTRICTED_PICKLIST`).
+  Always use `DefaultOn` to make the tab show.
+- The tab name is the OBJECT API name (e.g. `TI_Fnt_ExportImportRelatedInfo__c`).
+- If a non-`DefaultOn` setting already exists, the helper PATCHes it (does not
+  duplicate).
+
+## Verification (never trust the write alone)
+
+After granting, confirm LIVE that each tab is `DefaultOn`:
+```
+SELECT Name,Visibility FROM PermissionSetTabSetting
+WHERE ParentId=<SalesFrontAdmin Id> AND Name='<Obj>__c'
+```
+Report per object: tab visibility = `DefaultOn`. A tab left NOT SET / `Hidden` is
+a MISS — the object work is not "done" until its tab (if it has one) is visible.
+
+## Guardrails
+
+- Mandatory + automatic on `SalesFrontAdmin`; never ask whether to grant or which
+  permission set — the only exception is honoring a DIFFERENT permission set the
+  user explicitly named for this deploy.
+- Only applies to objects that actually got a `CustomTab` (H6 = TRUE). Objects
+  with no tab (H6 = FALSE/blank) are skipped here — nothing to make visible.
+- This is a permission-set write to the org; per `deploy-no-password-policy.mdc`
+  no password is required, but the change is still verified live.
+- All existence/visibility reads use the Tooling API, never `sobject describe`.

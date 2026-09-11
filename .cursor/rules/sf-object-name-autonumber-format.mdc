@@ -1,0 +1,55 @@
+---
+description: AutoNumber Name field with a blank display format is a hard blocker — PARK the object, never guess the format
+alwaysApply: true
+---
+# AutoNumber Name Field With a BLANK Display Format = HARD BLOCKER (PARK, never guess)
+
+When an object's standard **`Name`** field is declared as **AutoNumber** on the
+sheet (object-meta `Name Field Type` = `Autonumber`) but its **display format**
+(`Name Field Display Format`) is **BLANK**, the object is **un-deployable** and
+MUST be treated as a Step-0 blocker. Salesforce REJECTS a CustomObject whose
+`<nameField>` is AutoNumber with no `displayFormat`, so neither a create nor an
+update of that object can succeed until a format is supplied.
+
+This applies to NEW objects (create) AND to existing objects whose Name is being
+changed to AutoNumber.
+
+## Why this rule exists (real incident, 2026-09-09)
+
+The new object `TI_Fnt_ExportControlClassification__c` declared `Name =
+AutoNumber` with an empty display format. It could not be created. It was parked
+(flagged, not deployed) while the sibling objects (`AppendedTableMaster`,
+`ContainerCertificate`, `ConditionsPerformanceReport`) deployed normally.
+
+## Required behavior (every object, every run)
+
+1. **Detect at Step-0.** While scanning the object-meta block (live, per
+   `read-sheet-live.mdc`), if `Name Field Type` is AutoNumber and
+   `Name Field Display Format` is blank → this is a HARD `ERROR` blocker for the
+   WHOLE object.
+2. **PARK the object — do NOT deploy it.** Exclude it from the deploy set. Other
+   objects in the same batch that are clean still deploy.
+3. **Flag it via `flag_blocker.py`** (coupled AH note + Col-A highlight) on the
+   object's lead field row, with a message stating the object is parked because
+   its AutoNumber Name field has a blank display format, pending the sheet
+   owner's decision. Also set the affected fields' AI `Deployment Status` to
+   `Not Deployed`.
+4. **NEVER auto-generate or guess the display format.** This is the key
+   distinction from a blank FORMULA body (which IS auto-filled with a
+   return-type dummy per `sf-deploy-delta-and-blockers.mdc`): a Name numbering
+   scheme (prefix + width, e.g. `ECC-{0000000000}`) is a business/client
+   decision. Fabricating one would permanently mis-number every record. Ask the
+   sheet owner (e.g. Yagai-san) for the exact format.
+5. **When the format arrives:** write it into the object-meta display-format cell
+   (gated sheet write, per `sheet-write-confirmation.mdc`), then deploy the
+   CustomObject and verify live.
+
+## Guardrails
+
+- A blank AutoNumber display format is a HARD blocker, not a warning — never let
+  such an object into the package.
+- Reads are LIVE; the flag is coupled (AH + Col-A) via `flag_blocker.py`.
+- Do not confuse this with the empty-formula auto-dummy behavior — formulas get a
+  safe dummy, AutoNumber Name formats never do.
+- Text Name fields and AutoNumber Name fields WITH a valid format are fine and
+  deploy normally.
