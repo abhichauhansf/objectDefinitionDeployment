@@ -1,0 +1,146 @@
+---
+description: Semantics of the object-tab columns after relationshipName in the client's finalized "Format" sheet — Y deleteConstraint, Z Tab, AA section, AD IsDelete (delete flag), AE WIP (skip), AH "GDC AI Tool Comments" (AI review-comment column), AI "Deployment Status" (per-field org deploy status), AJ–BA spare AI columns, BB–BV actor/FLS columns. Governs which field rows to include/skip/delete, where the AI writes review comments, and where per-field deploy status is recorded. Locate columns by HEADER NAME, not fixed index.
+alwaysApply: true
+---
+
+# Object-Tab Columns after relationshipName (client "Format" layout)
+
+These columns appear on every object-definition tab to the right of
+`relationshipName` (column X), per the client's finalized **Format** sheet. Honor
+them in all field work. **Locate each column by its HEADER NAME** (the client
+keeps the order stable but header-driven lookup is mandatory and reshuffle-proof);
+the 0-based indices below are only a fallback.
+
+| Col | idx | Header | Meaning / handling |
+|-----|----:|--------|--------------------|
+| Y  | 24 | deleteConstraint | **Field-definition column.** Lookup delete behavior `SetNull`/`Restrict`/`Cascade`; blank = generator default. |
+| Z  | 25 | Tab              | **Page-layout tab** placement (top-level tab on the record page). Consumed by `gen_tabbed_page.py`. |
+| AA | 26 | section          | **Page-layout section** within a tab. Consumed by the page generators. |
+| AB | 27 | SAPItemName      | Discussion column. **Ignore.** |
+| AC | 28 | sourceItemNo     | Discussion column. **Ignore.** |
+| AD | 29 | **IsDelete**     | **DELETE flag.** `TRUE`/`true` ⇒ the field must be **DELETED** from the org (destructive). Route to a separate DELETE set — never create/update it. Blank/`FALSE` = normal. |
+| AE | 30 | **WIP**          | **Skip flag.** `TRUE`/`true`/`X`/`x` (any case) ⇒ the row is work-in-progress → **IGNORE entirely** (do not name, generate, deploy, or delete it). |
+| AF | 31 | ConfirmComments  | Discussion column. **Ignore.** |
+| AG | 32 | reviewComments   | Discussion column. **Ignore.** |
+| AH | 33 | **GDC AI Tool Comments** | **AI review-comment column (OUR designated use).** The AI writes its review/validation/fix notes here — see below. (Formerly `FreeColumnGDC1`; header renamed by client request.) |
+| AI | 34 | **Deployment Status** | **Per-field org deploy-status column (OUR designated use).** The AI writes whether the field is present in the target org — see below. (Formerly `FreeColumnGDC2`.) |
+| AJ–BA | 35–52 | FreeColumnGDC3–20 | Spare AI columns — unassigned; available for future AI purposes. |
+| BB–BV | 53–73 | actor / Persona cols | Actor columns for field-level security **later**. **Ignore for now.** |
+| BW+ | 74+ | FreeColumnJP1…  | Discussion columns. **Ignore.** |
+
+## Rules
+
+1. **WIP skip (AE):** skip any row whose `WIP` column = `TRUE`/`true`/`X`/`x`
+   (case-insensitive). Treat it as not present — never name, generate, deploy, or
+   delete it.
+2. **IsDelete (AD):** a row with `IsDelete` = `TRUE`/`true` is a **deletion**
+   request → put it in a separate DELETE set handled by the destructive-deploy
+   flow (see `sf-deploy-delta-and-blockers.mdc`). It is NOT a create/update and
+   must never be part of the normal field package. A row that is BOTH WIP and
+   IsDelete is skipped (WIP wins).
+3. **Live reads:** never evaluate WIP or IsDelete from a cached snapshot — read
+   the sheet live (`read-sheet-live.mdc`).
+4. **Header-driven columns:** locate `Tab`, `section`, `IsDelete`, `WIP`,
+   `GDC AI Tool Comments` (AH), and `Deployment Status` (AI) by header name (fall
+   back to the indices above only if the header is absent). The scripts
+   `fetch_sheet.py`, `mark_wip.py`, `write_back.py`, `write_ai_comments.py`,
+   `write_deploy_status.py` follow this. Note AH's header text is now
+   **`GDC AI Tool Comments`** (was `FreeColumnGDC1`) — match either for
+   backwards-compat, prefer the new name.
+5. **Tab (Z) + section (AA):** page-layout inputs — `Tab` = top-level record-page
+   tab, `section` = section within it. Consume only when doing page-layout work.
+6. **Discussion columns (AB, AC, AF, AG, BW+):** never write to them; they belong
+   to the user's discussion.
+7. **Actor columns (BB–BV):** reserved for field-level security later — do not
+   read or write them until the user asks.
+8. **Column Y (deleteConstraint):** field-definition column; read for Lookup
+   delete behavior, leave blank unless the user specifies a value.
+9. **Block-end markers `END[…]` (Column A):** each block on a tab is terminated by
+   an `END[XXX]` cell in **Column A**, where `XXX` names the block — i.e.
+   `END[XXX]` marks the end of the area corresponding to `XXX` (confirmed by the
+   sheet owner Takeaki Yagai, 2026-09-01). See the section below; the **field
+   list ends at `END[項目]`** and nothing past it is a field.
+
+## Block markers — `END[…]` (field-list / area boundaries)
+
+Every "Format"-style object tab is split into stacked blocks, each closed by an
+`END[XXX]` cell in **Column A** (the `No.` column, which otherwise only holds row
+numbers). `END[XXX]` = end of the area whose header is `XXX`. Observed order:
+
+| Marker (Col A) | Closes block | 
+|-----|-----|
+| **`END[項目]`** | **the FIELD list** (this is the field-scan terminator) |
+| `END[レコードタイプ]` | Record Types |
+| `END[入力規則]` | Validation Rules |
+| `END[ルックアップ検索条件]` | Lookup Search Filters |
+
+Rules:
+- The FIELD list is always the FIRST block, so the **first `END[...]` cell
+  (`END[項目]`) is the authoritative end-of-field-list marker.** STOP the field
+  scan there — never parse Record-Type / Validation-Rule / Lookup-Filter rows as
+  fields (doing so produces bogus "missing label/type/API name" validation
+  errors).
+- `fetch_sheet.py` enforces this: it breaks the row scan on the first Column-A
+  cell starting with `END[` (`FIELD_LIST_END_PREFIX`). The older gray-guard line
+  (`行挿入する場合は当行より上部`, col C) is kept only as a fallback for legacy tabs
+  that predate the `END[…]` convention.
+- These markers are read LIVE with the rest of the tab (`read-sheet-live.mdc`);
+  never infer the boundary from a cached snapshot.
+
+## AI review-comment column — AH (`GDC AI Tool Comments`)
+
+The AI records its review comments in **AH** (header **`GDC AI Tool Comments`**,
+formerly `FreeColumnGDC1`) on the specific field row they concern, at two stages:
+- **Stage 1 — sheet validation:** each `validate_sheet.py` ERROR/WARN becomes a
+  `[VALIDATION <date>] <check>: <message>` note on that field's AH cell.
+- **Stage 2 — on-the-go deploy fix:** any fix the AI applies during deploy becomes
+  a `[FIX <date>] <note>` on that field's AH cell.
+
+Use `scripts/write_ai_comments.py` (`--report` for stage 1, `--fixes` for stage 2).
+It APPENDS to existing AH text (never clobbers), de-dupes identical lines, and
+skips WIP rows. Writing AH is a **gated sheet write** (`sheet-write-confirmation.mdc`):
+preview the `cell: old → new` diff and get the user's confirmation before `--apply`.
+
+## Deployment-status column — AI (`Deployment Status`)
+
+Column **AI** (header **`Deployment Status`**, formerly `FreeColumnGDC2`) records,
+per field row, whether that field is actually present in the target org, checked
+LIVE against the object. Locate it by header name (fallback index 34).
+
+Allowed values written by the tool:
+- **`Deployed`** — the field's API name EXISTS in the target org (custom field
+  confirmed via the Tooling `CustomField` object — FLS-independent — or a known
+  standard field).
+- **`Not Deployed`** — a deployable custom field (`__c`) whose API name is NOT in
+  the org.
+- **`Standard`** — a standard field (no `__c`, e.g. `OwnerId`, `Name`,
+  `CreatedDate`) — always present, not tool-deployed.
+- **`Deleted`** — a field row processed as a DELETION (IsDelete=TRUE) that was
+  actually removed from the org (confirmed live absent via the Tooling
+  `CustomField` object after the destructive deploy). Set this on every deleted
+  row so the sheet reflects the destructive operation.
+- (WIP rows are skipped; blank-API/noise rows are skipped.)
+
+**AI must always mirror the LAST operation on the row** (see
+`sf-deploy-status-column-always.mdc`): after a create/update deploy the row's AI
+is `Deployed`; after a destructive delete the row's AI is `Deleted`. Updating AI
+based on the operation is MANDATORY, not optional.
+
+Rules:
+- The status is always derived from a LIVE org check (Tooling API for custom
+  fields — never `sobject describe`, which is FLS-gated), per object, at write
+  time. Never infer it from a cached snapshot or a deploy log.
+- Refresh AI after every deploy (see `sf-post-deploy-fls-and-flexipage.mdc`) and
+  whenever the user asks for a field-level deploy-status snapshot.
+- Writing AI is a **gated sheet write** (`sheet-write-confirmation.mdc`): preview
+  the `cell: old → new` diff and get the user's confirmation before applying. The
+  helper is `scripts/write_deploy_status.py`.
+
+## Highlighting convention (MANDATORY)
+
+When highlighting rows (blockers, formula fills, WIP, etc.), color **only the
+Column A ("No.") cell** of the target row — never the whole row / data-column
+span. Colleagues color cells in the data columns for their own review, so
+whole-row fills would overwrite their work. The scripts `highlight_rows.py` and
+`highlight_blockers.py` are fixed to Column A only (`START_COL, END_COL = 0, 1`);
+keep it that way. Highlighting is still a gated sheet write.

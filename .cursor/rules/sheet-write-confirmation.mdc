@@ -1,0 +1,48 @@
+---
+description: Mandatory confirmation gate before ANY write/change to a Google Sheet (cells, values, formatting, tabs, or structure). Applies to every script, Apps Script, Sheets API call, or tool that mutates a sheet.
+alwaysApply: true
+---
+
+# Sheet-Write Confirmation Gate (MANDATORY)
+
+Never modify a Google Sheet without the user's explicit, informed confirmation
+for that specific change. Reads are always free; writes are always gated.
+
+## What counts as a "write" (gated)
+
+Any operation that creates, updates, deletes, or reorders sheet content, e.g.:
+- Writing/clearing cell values or formulas (Sheets API `values.update`,
+  `values.append`, `values.batchUpdate`, `batchUpdate` requests).
+- Adding / renaming / deleting / duplicating tabs (e.g. a "Data Glossary" tab,
+  a changelog tab, writing generated field API names back into an object tab).
+- Formatting changes (colors, headers, merges, column resizing).
+- Apps Script executions that edit the sheet.
+- Any "propose → apply" flow in the sheet-editor: the **apply** step is gated.
+
+Read-only operations (fetch for validation, `--list-tabs`, describe, analysis,
+exporting to `temp_updates.json`) are NOT gated.
+
+## Required flow before any write
+
+1. State exactly what will change, in plain English:
+   - spreadsheet + tab name,
+   - the cells / columns / range affected,
+   - old value → new value (or "new tab", "delete N rows", etc.),
+   - row/field count impacted.
+2. Prefer showing a concrete preview/diff (e.g. a table of `cell: old → new`).
+3. Ask the user to confirm this specific change, and STOP.
+4. Proceed ONLY after the user explicitly confirms.
+5. Confirmation is for that ONE change set only. A new/different write requires a
+   fresh confirmation — never batch multiple distinct writes under one approval,
+   and never reuse a prior confirmation for a later edit.
+
+## Guardrails
+
+- If a request is ambiguous about what will be written, ask first — do not guess
+  and do not write speculatively.
+- Default to the least-destructive option (e.g. write to a NEW tab rather than
+  overwriting an existing one) and surface that choice to the user.
+- This gate is independent of the deploy authorization and the org/scope
+  gates; a sheet write needs its own confirmation even if those were satisfied.
+- If the user grants blanket pre-approval ("just edit whatever"), still confirm
+  each distinct write set individually — summarize and confirm per change.

@@ -1,0 +1,97 @@
+---
+description: MANDATORY post-object-creation step. Whenever a NEW custom object is created/deployed, check its object-tab "Create Tab" flag (cell H6 in the object sheet); if TRUE, create a CustomTab for it, then ASK the user whether to add it to any Lightning app (never assume). Applies to single-object and multi-object object-creation deploys.
+alwaysApply: true
+---
+
+# CustomTab + Lightning-App Prompt After Object Creation (MANDATORY)
+
+Whenever a NEW custom object is created (i.e. the object itself was deployed,
+per the object-existence pre-check rule), the follow-up steps below are REQUIRED
+for that object. This applies to a single object AND to any deploy that creates
+multiple objects — do it PER newly-created object, every time.
+
+> Scope: this triggers only when the OBJECT is newly created. Field-only deploys
+> to an already-existing object do not require a new tab, but if that object has
+> no CustomTab yet AND its H6 flag is TRUE, still offer to create one.
+
+## The "Create Tab" flag (object sheet cells H5 / H6) — READ FIRST
+
+Each object-definition tab in the Google Sheet carries a per-object tab-creation
+control in its object-meta header block:
+
+- **`H5`** = label `タブ作成 (Create Tab)`.
+- **`H6`** = the value: `TRUE` → create the CustomTab; `FALSE` or blank → SKIP tab
+  creation for that object (deploy the object/fields only, no tab).
+
+Read `H6` **live** from the object's sheet tab (per the read-sheet-live rule)
+before deciding. `fetch_sheet.py` / `prep_deploy.py` surface this value; if it is
+missing, treat blank as `FALSE` (do not create a tab) and surface that to the user.
+
+## Step 1 — Create a CustomTab ONLY when H6 = TRUE
+
+For every newly-created object `<Obj>__c` whose object-sheet `H6` = `TRUE`,
+generate and deploy a CustomTab. If `H6` is `FALSE`/blank, DO NOT create a tab —
+skip Step 1 (and Step 2) for that object. Never create a tab for an object whose
+flag is not `TRUE`.
+
+- Source file: `force-app/main/default/tabs/<Obj>__c.tab-meta.xml`
+- Minimal valid content for a custom-object tab:
+
+```xml
+<?xml version="1.0" encoding="UTF-8"?>
+<CustomTab xmlns="http://soap.sforce.com/2006/04/metadata">
+    <customObject>true</customObject>
+    <motif>Custom53: Bell</motif>
+</CustomTab>
+```
+
+- The tab `fullName` = the object API name (the file name). Include
+  `CustomTab` members in the deploy `package.xml`.
+- Deploying the CustomTab writes to the org; verify live afterwards.
+- Verify live afterwards: `sf org list metadata --metadata-type CustomTab`
+  must list every new tab.
+
+## Step 1b — GRANT TAB VISIBILITY (MANDATORY, automatic) — see `sf-tab-visibility-mandatory.mdc`
+
+A deployed `CustomTab` is INVISIBLE to users until its visibility is explicitly
+granted — creating the tab (and adding it to an app in Step 2) is NOT enough. So
+for every tab created in Step 1, you MUST immediately grant its visibility on the
+default permission set **`SalesFrontAdmin`** (or a user-named alternative),
+AUTOMATICALLY and without asking, per `sf-tab-visibility-mandatory.mdc`:
+
+```
+python scripts/grant_tab_visibility.py --tabs <Obj>__c[,<Obj2>__c,...]
+```
+
+Use `Visibility='DefaultOn'` (Tooling `PermissionSetTabSetting`; the words
+`Visible`/`Available` are rejected by the restricted picklist). Verify live that
+each tab is `DefaultOn` before moving on. This is as mandatory as the post-deploy
+FLS auto-grant — a tab left NOT SET is a MISS.
+
+## Step 2 — ASK about Lightning apps (never assume)
+
+Only for objects that actually got a CustomTab in Step 1 (i.e. `H6` = `TRUE`):
+after the tab exists, you MUST ask the user whether they want the object(s)
+added to any Lightning app, and if so WHICH app(s). Do not add to any app
+without an explicit answer. Objects whose `H6` was `FALSE`/blank have no tab, so
+they are not eligible for app navigation — skip them here.
+
+- Ask plainly (use the question tool): "Add these new object tab(s) to a
+  Lightning app? If yes, which app (e.g. `SalesFrontProto`)?"
+- If the user says NO / skip → stop; tab already exists, nothing more to do.
+- If the user names an app → retrieve that app live
+  (`sf project retrieve start --metadata CustomApplication:<App>`), inject
+  `<tabs><Obj>__c</tabs>` for each object (after `<navType>`, before
+  `<uiType>`) while PRESERVING all existing app settings (brand, label,
+  navType, utilityBar, etc.), then deploy `CustomApplication:<App>` — an org
+  write — and verify the app's `<tabs>` live.
+
+## Guardrails
+
+- The `H6` flag is the single source of truth for whether a tab is created. Never
+  create a tab for an object whose `H6` is not `TRUE`, and never silently create
+  one when the flag is missing — treat blank as `FALSE`.
+- Preserve existing app metadata; only add `<tabs>` — never drop brand/label/
+  utilityBar or reorder unrelated elements.
+- New tabs are `DefaultOff` on profiles; if the user needs them visible per
+  profile/permission-set, offer to set tab visibility — but only when asked.

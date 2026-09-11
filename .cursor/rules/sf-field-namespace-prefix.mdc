@@ -1,0 +1,39 @@
+---
+description: Custom Salesforce field API names generated for this project must start with the namespace prefix TI_Fnt_ and end with __c. Applies to name_fields.py, finalize_names.py, generators, and any field-naming proposal or sheet write-back.
+alwaysApply: true
+---
+
+# Custom Field Namespace Prefix: TI_Fnt_ (MANDATORY)
+
+Every NEWLY GENERATED custom field API name in this project must use the form:
+
+    TI_Fnt_<Component>__c
+
+- Prefix: `TI_Fnt_` (exact case — not `TI_FnT_`, `TI_FNT_`, or `TI_LOGI_`).
+- Suffix: `__c` (per the field-api-naming rule).
+- Example: `TI_Fnt_SalesOrganization__c`, `TI_Fnt_Incoterms__c`.
+
+## Rules
+
+1. Apply the prefix only ONCE — never `TI_Fnt_TI_Fnt_…`. If a component already
+   begins with `TI_Fnt_`, do not add it again.
+2. Do NOT prefix or rename STANDARD fields (`Id`, `Name`, `OwnerId`,
+   `CreatedDate`, `custom == false`, etc.) — leave them untouched.
+3. Do NOT re-prefix fields that already exist in the org with a different, valid
+   API name; the prefix applies to fields we are naming for the first time.
+4. Length budget: the FULL name including `TI_Fnt_` (7) and `__c` (3) must be
+   <= 40 chars, so the component has ~30 chars. Shorten the component sensibly
+   (accepted abbreviations, drop filler) if it overflows — flag, never truncate
+   mid-word.
+5. Full name must match `^TI_Fnt_[A-Za-z][A-Za-z0-9]*__c$` and be unique within
+   the object (case-insensitive).
+
+## Note on existing conventions
+
+Some existing objects/fields in the org use other prefixes (`TI_Logi_`,
+`TI_STC_`) or none at all. This rule governs fields WE generate for this
+project; if a target object's existing fields follow a different convention,
+surface that to the user before applying, but default to `TI_Fnt_`.
+
+Writing names into the Google Sheet remains gated by the sheet-write
+confirmation rule.

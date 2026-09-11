@@ -1,0 +1,120 @@
+---
+description: MANDATORY pre-deploy object-existence gate. Before deploying ANY field(s) of an object, first check whether the object exists in the target org; if missing, deploy the object too; always create/refresh the object's report tab; then verify in the org that the deploy actually landed. Applies to single-object and multi-object deploy commands.
+alwaysApply: true
+---
+
+# Object-Existence Pre-Check Before Field Deploy (MANDATORY)
+
+Whenever you are about to deploy FIELDS of any object to a target org, you MUST
+first determine whether that object already exists in the org, and act
+accordingly. This applies to a single object AND to any command that touches
+multiple objects — run the check PER object, every time. No exceptions.
+
+## Preferred entry point — `prep_deploy.py` (batch orchestrator)
+
+For single-object OR multi-object deploys, prefer the one-command orchestrator
+`scripts/prep_deploy.py`, which performs this entire flow with all gates and
+batches every target object into ONE validated package + ONE deploy:
+
+```
+# safe: prepare + validate + existence pre-check + check-only dry-run (no writes)
+python scripts/prep_deploy.py --org "<ORG>" --tabs "<tab1>,<tab2>,..."
+
+
+
+The orchestrator enforces the validation gate, existence pre-check, dry-run, real `deploy start`
+(never a stale/dry-run log), mandatory `verify_deploy.py`, and per-object report
+refresh. Running the individual scripts by hand is still allowed, but the same
+gates below apply.
+
+## Required flow for EVERY object being deployed
+
+For each object `<Obj>__c` in the deploy set, in order:
+
+1. **Existence check (live, before packaging/deploy).** Query the target org
+   for the object — do NOT assume, and do NOT rely on a cached describe or a
+   prior deploy log:
+   ```
+   sf data query --target-org "<ORG>" --json \
+     --query "SELECT QualifiedApiName FROM EntityDefinition WHERE QualifiedApiName='<Obj>__c'"
+   ```
+   `totalSize == 1` → object EXISTS. `0` → object MISSING.
+
+2. **Branch on existence:**
+   - **Object MISSING** → the deploy MUST include the CustomObject itself
+     (`objects/<Obj>__c/<Obj>__c.object-meta.xml`) **plus** its fields. Ensure
+     `generate_xml.py` produced the object meta and that `build_manifest.py`
+     shows `CustomObject 1` in the package. Deploy object + fields together.
+   - **Object EXISTS** → deploy only the fields (the CustomObject may still be
+     in the package harmlessly, but you are not creating a new object).
+
+3. **Always create/refresh the object's report tab.** In BOTH branches, after a
+   successful, verified deploy, create or refresh the object's tab in
+   `sf-deploy/reports/Object_Deployment_Report.xlsx` via `build_object_report.py`.
+   Every deployed object gets exactly one report tab — no object is deployed
+   without its tab.
+
+4. **Deploy for real with the correct flag.** A real deploy is
+   `python scripts/deploy.py --start …` (which runs `sf project deploy start`).
+   `--start` is the ONLY flag that writes to the org. There is NO `--start`
+   alias such as `--run`; passing an unknown flag makes argparse exit WITHOUT
+   deploying. Never invent flags.
+
+5. **Post-deploy verification (live, AUTOMATED) — never trust the log alone.**
+   After the deploy command returns, run the verification helper, which derives
+   the expected object + fields straight from the generated `force-app` metadata
+   and confirms them against the org with **no manual list**:
+   ```
+   python scripts/verify_deploy.py --target-org "<ORG>" --objects <Obj>__c
+   # exit 0 = every object+field confirmed; non-zero = did NOT fully land
+   ```
+   Treat a non-zero exit as a hard FAILURE regardless of any "Succeeded" text in
+   the deploy log, and do not claim success until it exits 0.
+
+   **Use the Tooling API for existence — NOT FieldDefinition / describe / SOQL.**
+   `FieldDefinition`, `sf sobject describe`, and plain `SELECT <field>` are all
+   **Field-Level-Security (FLS) gated**: a field that deployed perfectly but
+   whose FLS was never granted to the running user is INVISIBLE there and looks
+   "missing", producing false failures. The authoritative existence check is the
+   Tooling `CustomField` object (metadata-level, FLS-independent), which
+   `verify_deploy.py` uses:
+   ```
+   sf data query --use-tooling-api --target-org "<ORG>" --json --query \
+     "SELECT DeveloperName FROM CustomField \
+      WHERE EntityDefinition.QualifiedApiName='<Obj>__c' AND DeveloperName LIKE 'TI_Fnt_%'"
+   ```
+   (Tooling `DeveloperName` omits the `__c` suffix — re-add it when comparing.)
+
+6. **ALWAYS update the deployment report doc.** After a verified deploy, create
+   or refresh the object's tab in `sf-deploy/reports/Object_Deployment_Report.xlsx`
+   via `build_object_report.py`. This is mandatory for every deployed object —
+   the report is not optional and must reflect the just-verified org state.
+
+## Why this rule exists (do not repeat this failure)
+
+A real deploy was believed successful because the code `grep`-ed
+`.build/last_deploy.log` while the actual command had been rejected (wrong flag
+`--run` instead of `--start`). The log still held a STALE check-only
+(`--dry-run`) result that said `Status: Succeeded`, so two objects
+(`Sales_IncidentalExpensesDetail__c`, `Sales_StandaloneIncidentalExpenses__c`)
+were reported as deployed but were never created in the org.
+
+Guardrails that follow from this:
+- The check-only/dry-run and the real deploy write to the same
+  `.build/last_deploy.log`. NEVER infer real-deploy success from that log
+  without the live org verification in step 5.
+- After running `deploy.py`, check its **exit code** and confirm the log's
+  first line (`# command: …`) contains `deploy start` WITHOUT `--dry-run` for a
+  real deploy.
+- Redirecting deploy output to `/dev/null` and grepping a possibly-stale log is
+  not acceptable as the sole success signal.
+
+## Interaction with other rules
+
+- The real deploy (`deploy.py --start`) writes to the org. This existence check,
+  the dry-run, and live verification still apply and are not bypassed.
+- Reads here (EntityDefinition/FieldDefinition queries, describe) are free and
+  must be run live; they are not gated.
+- The report-tab write targets the local Excel workbook, not the Google Sheet,
+  so it is not a Google-Sheet write; still generate it only after a verified
+  deploy.

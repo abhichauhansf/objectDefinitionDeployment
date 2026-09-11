@@ -1,0 +1,54 @@
+---
+description: MANDATORY — every FlexiPage field section must lay out its fields in TWO columns (fields split left/right within each section), for both flat section-only pages (gen_record_page.py) and tabbed pages (gen_tabbed_page.py). Single-column sections are non-compliant. Layers on top of sf-post-deploy-fls-and-flexipage.mdc GATE 2.
+alwaysApply: true
+---
+# FlexiPage Sections Must Be TWO-COLUMN (MANDATORY)
+
+Every field **section** on a generated Lightning Record Page (FlexiPage) MUST
+arrange its fields across **two columns** — the section's fields are split
+left/right (balanced), not stacked in a single column. This applies to EVERY
+object we build a record page for, on BOTH page shapes:
+
+- **flat section-only pages** → `scripts/gen_record_page.py`
+- **tabbed pages** → `scripts/gen_tabbed_page.py`
+
+A section rendered as a single column is **non-compliant** and must be
+regenerated as two-column before (re)deploy.
+
+## Rules
+
+1. **Default = 2 columns per section.** Both page generators default to
+   `--cols 2`; do NOT pass `--cols 1`. Each `flexipage:fieldSection` therefore
+   emits **two `flexipage:column` blocks**, with the section's fields balanced
+   across them in sheet order (first half → left column, second half → right).
+2. **One-field sections stay one column.** A section holding a single field is
+   rendered in one column (there is nothing to split); this is expected and
+   compliant — two columns are required only when a section has ≥ 2 fields.
+3. **The 100-field-per-column cap still applies.** If a section is so large that
+   two columns would exceed Salesforce's 100-items-per-column limit, the
+   generator adds further columns as needed (`cap_cols = ceil(fields/100)`); the
+   floor remains two columns.
+4. **Verify after generation.** For every generated page, confirm each multi-field
+   `fieldSection` contains **two** `flexipage:column` blocks (e.g. grep the
+   `.flexipage-meta.xml`). A multi-field section with only one column is a MISS —
+   regenerate.
+5. **Applies retroactively.** Any record page previously generated as
+   single-column must be regenerated to two-column and redeployed when next
+   touched.
+
+## Implementation (keep it wired)
+
+- `gen_record_page.py` and `gen_tabbed_page.py` both take `--cols` (default
+  **2**) and split each section's fields into `ncols = max(desired_cols,
+  cap_cols)` balanced chunks, one `flexipage:column` per chunk.
+- Do not lower the default back to 1. If a caller needs a special case, they must
+  pass `--cols` explicitly and justify it — the standing default is two columns.
+
+## Guardrails
+
+- This governs the VISUAL column split inside sections; it does not change WHICH
+  fields are placed (org-present, non-WIP, non-disallowed) or the section source
+  (col AA) / tab source (col Z) — those remain per
+  `sf-post-deploy-fls-and-flexipage.mdc` GATE 2.
+- FlexiPage (re)deploy remains a gated org write and must be verified live and set
+  as the object's org default (`actionOverrides`) per GATE 2b.

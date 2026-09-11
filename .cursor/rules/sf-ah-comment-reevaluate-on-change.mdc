@@ -1,0 +1,75 @@
+---
+description: MANDATORY — whenever a field's state changes (it is modified, (re)deployed, deleted, parked, drift-fixed, or its sheet definition/attribute is edited), you MUST re-evaluate that field's AH review-comment (col AH, `GDC AI Tool Comments`) AGAINST the new reality and, if any existing AH note is now stale/inaccurate/contradicted, correct it — never leave a misleading comment. Pairs with sf-deploy-status-column-always.mdc (AI status) and sf-sheet-columns.mdc (AH). AH writes are gated (sheet-write-confirmation.mdc).
+alwaysApply: true
+---
+
+# Re-evaluate & De-stale the AH Comment on EVERY Field-State Change — MANDATORY
+
+The AH review-comment column (**AH**, header `GDC AI Tool Comments`) is a
+per-field running record. A note that was true at one point becomes a LIE the
+moment the field's reality changes. Therefore, whenever ANYTHING about a field
+changes, you MUST re-read that field's AH cell LIVE, compare it to the new
+reality, and fix any note that is now stale, inaccurate, or contradicted. A
+field operation is NOT "done" while its AH cell still says something untrue.
+
+## Why this rule exists (real incident, 2026-09-09)
+
+On `TI_Fnt_ExportImportRelatedInfo__c`, 10 formula fields carried a
+`[FIX 2026-09-08]` AH note saying *"formula body on the sheet was a JP
+placeholder/description … replaced with dummy \"TBD\""*. That note was written
+while the pipeline was reading the WRONG column (G). After the column fix (read
+col H), the sheet actually held a REAL formula — so the old note was now false
+and misleading. The comment had to be re-evaluated and superseded with an
+accurate `[VALIDATION 2026-09-09]` note. Had we skipped the re-evaluation, the
+sheet would have carried a wrong explanation of each field's state.
+
+## When this fires (every time — no exceptions)
+
+Re-evaluate the AH comment for a field whenever ANY of the following happens:
+
+- The field is **(re)deployed** (create OR update — formula body, picklist
+  values, length, precision/scale, referenceTo, type, required, etc.).
+- The field is **delete+recreated** (data-type change) or **destructively
+  deleted** (IsDelete).
+- The field is **parked / flagged as a blocker** (or a prior blocker is
+  RESOLVED — the "blocked" note must then be cleared/updated).
+- The field's **sheet definition or any attribute is edited** (incl. an
+  attribute write-back per `sf-deploy-delta-and-blockers.mdc`), or a
+  drift/attribute-fix is applied.
+- A **tool/reader change** (e.g. the col-G→col-H fix) changes what the sheet was
+  understood to say for that field.
+- You are doing the mandatory "review comments for all deployed fields" pass.
+
+## Required behavior
+
+1. **Read the field's AH cell LIVE** (per `read-sheet-live.mdc`) right before/
+   after the change — never judge staleness from memory or a cached snapshot.
+2. **Compare every existing AH note to the new reality.** A note is STALE if it
+   states a cause, value, or status that the current org/sheet no longer bears
+   (e.g. "replaced with dummy" when the real value is now deployed; "blocked:
+   target missing" after the target was added and the field deployed; a picklist
+   value set that no longer matches; a formula body that changed).
+3. **Correct stale notes — do not just pile on.** AH is append-only by tool
+   default (`write_ai_comments.py` APPENDS + de-dupes), so the DEFAULT correction
+   is to append a dated superseding note (`[VALIDATION <date>]` / `[FIX <date>]`)
+   that states the current truth and, when useful, explicitly says it supersedes
+   the earlier note. When an old note is outright FALSE and appending would
+   confuse the reader, OVERWRITE that cell instead — but only with the user's
+   confirmation (it is still a gated write), and preserve any still-valid history.
+4. **Keep AH and AI consistent.** The AH note's stated status must agree with the
+   AI `Deployment Status` value set per `sf-deploy-status-column-always.mdc`
+   (e.g. don't leave AH saying "not deployed" while AI says `Deployed`).
+5. **Gated write.** Every AH edit (append OR overwrite) is a gated sheet write
+   (`sheet-write-confirmation.mdc`): preview the `cell: old → new` diff and get
+   confirmation before `--apply`. Prefer `flag_blocker.py` for blocker notes
+   (coupled AH note + Col-A highlight) and `write_ai_comments.py` for fix/
+   validation notes.
+
+## Guardrails
+
+- No field change is complete until its AH comment has been re-evaluated and any
+  stale note corrected — this is as mandatory as the AI status update.
+- Never delete genuine history gratuitously; supersede by default, overwrite only
+  when a note is actively misleading and the user approves.
+- All AH reads are LIVE and header-driven (`GDC AI Tool Comments`, fallback
+  `FreeColumnGDC1` / index 33); WIP rows are skipped.
