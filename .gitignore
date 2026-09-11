@@ -1,0 +1,38 @@
+# ── OS / editor noise ─────────────────────────────────────────────
+.DS_Store
+**/.DS_Store
+
+# ── Python ────────────────────────────────────────────────────────
+__pycache__/
+*.pyc
+*.pyo
+
+# ── SECRETS: Salesforce org auth — NEVER COMMIT ──────────────────
+# SFDX/SF CLI auth (refresh tokens for live orgs), minted access tokens
+**/.sfhome/
+**/.sf/
+**/.sfdx/
+**/orgauth.json
+*.token
+*.pem
+*.key
+*.p12
+
+# ── Build / transient artifacts ──────────────────────────────────
+**/.build/
+sf-deploy/mdapi/
+sf-deploy/force-app/
+sf-deploy/manifest/
+sf-deploy/reports/
+sf-deploy/temp_updates.json
+
+# ── Other-org metadata / unrelated heavy dirs ────────────────────
+ERPDEV03/
+sheet-editor/
+
+# ── Snapshots / archives ─────────────────────────────────────────
+*.zip
+.restore_from_history.py
+
+# ── Git metadata dir (sandbox workaround for blocked .git/) ───────
+git_meta/
