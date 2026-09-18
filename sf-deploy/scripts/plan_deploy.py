@@ -190,6 +190,67 @@ def build_attribute_expectations(
     return out
 
 
+def dependency_closures(
+    members: dict[str, list[str]],
+    new_objects: list[str],
+    created_fields: dict[str, list[str]],
+    translations: list[dict],
+) -> list[dict[str, list[str]]]:
+    """Unsplittable check-only closures: new object + fields + COT, and COT +
+    every new field a packaged translation references.
+
+    Check-only dry-runs each package against the unchanged org, so a field
+    part that assumes a CustomObject just created in the previous part, or a
+    translation part that assumes new fields just created, is independently
+    invalid.
+    """
+    field_set = set(members.get("CustomField") or [])
+    cot_by_obj: dict[str, list[str]] = {}
+    for m in members.get("CustomObjectTranslation") or []:
+        cot_by_obj.setdefault(build_manifest.object_of("CustomObjectTranslation", m), []).append(m)
+    fields_by_obj: dict[str, list[str]] = {}
+    for m in members.get("CustomField") or []:
+        fields_by_obj.setdefault(m.split(".", 1)[0], []).append(m)
+
+    referenced: dict[str, set[str]] = {}
+    created = {o: set(fs) for o, fs in created_fields.items()}
+    for t in translations:
+        if not t.get("package"):
+            continue
+        obj = norm(t.get("component"))
+        key = norm(t.get("key") or "")
+        field = key.split("::", 1)[0]
+        if field.endswith("__c") and field in created.get(obj, set()):
+            referenced.setdefault(obj, set()).add(field)
+
+    groups: list[dict[str, list[str]]] = []
+    new_set = set(new_objects)
+    for obj in sorted(new_set):
+        g: dict[str, list[str]] = {}
+        if obj in (members.get("CustomObject") or []):
+            g["CustomObject"] = [obj]
+        if fields_by_obj.get(obj):
+            g["CustomField"] = sorted(fields_by_obj[obj])
+        if cot_by_obj.get(obj):
+            g["CustomObjectTranslation"] = sorted(cot_by_obj[obj])
+        if g:
+            groups.append(g)
+
+    for obj, cots in sorted(cot_by_obj.items()):
+        if obj in new_set:
+            continue
+        needed = sorted(
+            f"{obj}.{f}" for f in referenced.get(obj, ())
+            if f"{obj}.{f}" in field_set)
+        if not needed:
+            continue
+        groups.append({
+            "CustomField": needed,
+            "CustomObjectTranslation": sorted(cots),
+        })
+    return groups
+
+
 def build_plan(rows: list[dict], snapshot: dict, *, sheet_id: str, tabs: str,
                lang: str = DEFAULT_LANG, new_only: bool = False,
                include_drift: set[str] | None = None,
@@ -210,6 +271,7 @@ def build_plan(rows: list[dict], snapshot: dict, *, sheet_id: str, tabs: str,
     new_fields: dict[str, list[str]] = {}
     skipped_fields: dict[str, list[str]] = {}
     skipped_deletes: dict[str, list[str]] = {}
+    created_fields: dict[str, list[str]] = {}
     delete_members: list[str] = []
 
     for obj in sorted(scope):
@@ -235,6 +297,7 @@ def build_plan(rows: list[dict], snapshot: dict, *, sheet_id: str, tabs: str,
         if not in_org:
             new_objects.append(obj)
         if absent:
+            created_fields[obj] = sorted(absent)
             new_fields[obj] = sorted(absent)
         if drift_fields:
             new_fields[obj] = sorted(set(new_fields.get(obj, [])) | set(drift_fields))
@@ -300,9 +363,26 @@ def build_plan(rows: list[dict], snapshot: dict, *, sheet_id: str, tabs: str,
     }
     members = {k: v for k, v in members.items() if v}
 
+    closures = dependency_closures(
+        members, new_objects, created_fields, translations)
+    package_errors: list[dict] = []
+    try:
+        manifest_parts = build_manifest.plan_parts(
+            members, max_components, atomic_groups=closures)
+    except build_manifest.PackageCapError as e:
+        manifest_parts = []
+        package_errors.append({
+            "id": e.object_api or "-",
+            "code": "PACKAGE_CAP",
+            "reason": str(e),
+        })
+
     errors = [t for t in translations
               if t.get("code") in {PARSE_ERROR, INVALID_LANG}
               or (t.get("code") == CONFLICT and not t.get("package"))]
+    validation_errors = ([{"id": e["id"], "code": e["code"],
+                           "reason": e.get("reason", "")} for e in errors]
+                         + package_errors)
     plan = {
         "target": snapshot.get("target") or {},
         "sheet": {"id": sheet_id, "tabs": [t.strip() for t in tabs.split(",") if t.strip()]},
@@ -324,9 +404,8 @@ def build_plan(rows: list[dict], snapshot: dict, *, sheet_id: str, tabs: str,
         "attributeExpectations": build_attribute_expectations(
             objects, rows, include_drift, object_updates),
         "manifestMembers": members,
-        "manifestParts": build_manifest.plan_parts(members, max_components),
-        "validationErrors": [{"id": e["id"], "code": e["code"],
-                              "reason": e.get("reason", "")} for e in errors],
+        "manifestParts": manifest_parts,
+        "validationErrors": validation_errors,
     }
     plan["summary"] = {
         "objects": len(objects),
@@ -345,7 +424,7 @@ def build_plan(rows: list[dict], snapshot: dict, *, sheet_id: str, tabs: str,
         "deletes": len(delete_members),
         "skippedDeletes": sum(len(v) for v in skipped_deletes.values()),
         "components": sum(len(v) for v in members.values()),
-        "packages": len(build_manifest.plan_parts(members, max_components)),
+        "packages": len(manifest_parts),
         "objectUpdates": len(object_updates),
         "additiveEmpty": not members,
         "empty": not members and not delete_members,
@@ -441,9 +520,7 @@ def main(argv: list[str] | None = None) -> int:
     if plan["validationErrors"]:
         for e in plan["validationErrors"]:
             print(f"⛔ {e['code']} {e['id']}: {e['reason']}")
-        print("⛔ fix the sheet — unparseable EN cells / invalid language codes / "
-              "unresolved translation CONFLICTS are validation errors, not missing "
-              "translations.")
+        print("⛔ fix the listed validation errors before building a package.")
         return 1
     return 0
 

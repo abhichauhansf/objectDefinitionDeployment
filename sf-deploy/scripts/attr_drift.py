@@ -95,8 +95,31 @@ def picklist_apis(tsv: str) -> list[str]:
     return [p.split(":")[-1].strip() for p in re.split(r"[;\n]", _tsv) if p.strip()]
 
 
+def _num(v):
+    s = str(v or "").strip()
+    if not s:
+        return None
+    try:
+        return int(float(s))
+    except Exception:
+        return s
+
+
+def _sbool(v) -> bool:
+    return str(v or "").strip().lower() in ("true", "x", "yes", "1")
+
+
+def _obool(v) -> bool:
+    return str(v or "").strip().lower() == "true"
+
+
 def expected_from_row(r: dict) -> dict:
-    """Sheet-side attributes a post-deploy verify must confirm for one field."""
+    """Sheet-side attributes a post-deploy verify must confirm for one field.
+
+    Includes every attribute ``compute_drift`` can detect: type/formula,
+    referenceTo, picklist values, plus length, visibleLines, precision, scale,
+    required, unique and externalId when the sheet specifies them.
+    """
     dt = (r.get("Data Type") or "").strip()
     tsv = (r.get("Type Specific Value") or "").strip()
     exp_base, exp_formula, _mapped = map_dt(dt)
@@ -107,7 +130,55 @@ def expected_from_row(r: dict) -> dict:
         expect["referenceTo"] = tsv
     if exp_base in ("Picklist", "MultiselectPicklist") and tsv:
         expect["picklist"] = picklist_apis(tsv)
+    if exp_base in ("Text", "TextArea", "LongTextArea", "EncryptedText", "Html") and not exp_formula:
+        length = _num(r.get("Length"))
+        if length is not None:
+            expect["length"] = length
+        vis = _num(r.get("Visible Lines"))
+        if vis is not None:
+            expect["visibleLines"] = vis
+    if exp_base in ("Number", "Currency", "Percent") and not exp_formula:
+        prec = _num(r.get("Precision"))
+        if prec is not None:
+            expect["precision"] = prec
+        sc = _num(r.get("Scale"))
+        if sc is not None:
+            expect["scale"] = sc
+    if exp_base not in ("MasterDetail", "Summary", "AutoNumber") and not exp_formula:
+        sreq = str(r.get("Required") or "").strip()
+        if sreq:
+            expect["required"] = _sbool(sreq)
+    for scol, ocol in (("Unique", "unique"), ("External ID", "externalId")):
+        sv = str(r.get(scol) or "").strip()
+        if sv:
+            expect[ocol] = _sbool(sv)
     return expect
+
+
+def secondary_mismatches(expect: dict, om: dict, *, require_present: bool = False
+                         ) -> list[str]:
+    """Compare length/visibleLines/precision/scale/required/unique/externalId.
+
+    ``require_present=False`` matches drift reporting (skip a numeric attr when
+    the org value is blank). Verification passes ``True`` so an approved
+    length/precision update cannot silently keep the old (or missing) value.
+    """
+    why: list[str] = []
+    for key in ("length", "visibleLines", "precision", "scale"):
+        if key not in expect:
+            continue
+        got = _num(om.get(key))
+        if got is None and not require_present:
+            continue
+        if got != expect[key]:
+            why.append(f"{key}: expected={expect[key]} org={got if got is not None else '(none)'}")
+    for key in ("required", "unique", "externalId"):
+        if key not in expect:
+            continue
+        got = _obool(om.get(key))
+        if got != bool(expect[key]):
+            why.append(f"{key}: expected={bool(expect[key])} org={got}")
+    return why
 
 
 def expected_name(meta: dict) -> dict:
@@ -270,37 +341,26 @@ def compute_drift(object_api: str, all_rows: list[dict], org: dict
     """
     sheet_rows = sheet_rows_for(object_api, all_rows)
     warnings: list[str] = []
-    # helpers for secondary-attribute compare
-    def _num(v):
-        s = str(v or "").strip()
-        if not s:
-            return None
-        try:
-            return int(float(s))
-        except Exception:
-            return s
-    def _sbool(v):  # sheet truthiness (TRUE/x/yes/1)
-        return str(v or "").strip().lower() in ("true", "x", "yes", "1")
-    def _obool(v):  # org metadata boolean
-        return str(v or "").strip().lower() == "true"
 
     # 3) compare
     drift, insync = [], 0
     for r in sheet_rows:
         api = r["Field API Name"].strip()
         dt = (r.get("Data Type") or "").strip()
-        tsv = (r.get("Type Specific Value") or "").strip()
         om = org.get(api)
         if om is None:
             drift.append({"field": api, "sheet": dt, "org": "(absent)",
                           "reason": "field not in org (not yet deployed)"})
             continue
-        exp_base, exp_formula, mapped = map_dt(dt)
+        expect = expected_from_row(r)
+        exp_base = expect.get("type") or ""
+        exp_formula = bool(expect.get("formula"))
+        _mapped = map_dt(dt)[2]
         ot = om.get("type", "")
         ohf = bool(om.get("formula"))
         oref = om.get("referenceTo", "")
         why = []
-        if not mapped:
+        if not _mapped:
             why.append(f"unmapped sheet Data Type '{dt}' — verify manually (org type={ot})")
         # --- primary: type / formula / referenceTo / picklist ---
         if ot != exp_base:
@@ -309,50 +369,20 @@ def compute_drift(object_api: str, all_rows: list[dict], org: dict
             why.append("sheet=Formula, org=NOT formula")
         if not exp_formula and ohf:
             why.append("sheet=non-formula, org=HAS formula")
-        # formula BODY compare (both sides are formulas): the original deploy may
-        # have shipped a DUMMY (e.g. "TBD"/0/false) when the real formula was in a
-        # column we weren't reading. Presence-only checks miss that, so compare the
-        # normalized bodies. Sheet formula body is Type Specific Value (col H).
-        if exp_formula and ohf and tsv:
+        if exp_formula and ohf and expect.get("formulaBody"):
             def _nf(x):  # case-insensitive, whitespace-insensitive
                 return re.sub(r"\s+", "", str(x or "")).lower()
-            if _nf(tsv) != _nf(om.get("formula")):
+            if _nf(expect["formulaBody"]) != _nf(om.get("formula")):
                 _of = (om.get("formula") or "").strip()
                 why.append(f"formula body differs (org={_of[:30]!r})")
-        if exp_base in ("Lookup", "MasterDetail") and tsv and oref and oref != tsv:
-            why.append(f"referenceTo: sheet={tsv} org={oref}")
-        if exp_base in ("Picklist", "MultiselectPicklist") and om.get("_picklist"):
-            # Normalize full-width JP punctuation (；->; ：->:) exactly like
-            # generate_xml before splitting entries on ';'/newline, then take the
-            # API side (after the label:api colon) — the org fullName IS the api
-            # side, so comparing the label kept it perpetually "drifted".
-            _tsv = tsv.translate({0xFF1B: ord(";"), 0xFF1A: ord(":")})
-            sv = [p.split(":")[-1].strip() for p in re.split(r"[;\n]", _tsv) if p.strip()]
-            if sv and set(sv) != set(om["_picklist"]):
-                why.append(f"picklist values differ ({len(sv)} sheet / {len(om['_picklist'])} org)")
-        # --- secondary attributes (only when the sheet specifies a value) ---
-        if exp_base in ("Text", "TextArea", "LongTextArea", "EncryptedText", "Html") and not exp_formula:
-            sl, ol = _num(r.get("Length")), _num(om.get("length"))
-            if sl is not None and ol is not None and sl != ol:
-                why.append(f"length: sheet={sl} org={ol}")
-            svl, ovl = _num(r.get("Visible Lines")), _num(om.get("visibleLines"))
-            if svl is not None and ovl is not None and svl != ovl:
-                why.append(f"visibleLines: sheet={svl} org={ovl}")
-        if exp_base in ("Number", "Currency", "Percent") and not exp_formula:
-            sp, op = _num(r.get("Precision")), _num(om.get("precision"))
-            ssc, osc = _num(r.get("Scale")), _num(om.get("scale"))
-            if sp is not None and op is not None and sp != op:
-                why.append(f"precision: sheet={sp} org={op}")
-            if ssc is not None and osc is not None and ssc != osc:
-                why.append(f"scale: sheet={ssc} org={osc}")
-        if exp_base not in ("MasterDetail", "Summary", "AutoNumber") and not exp_formula:
-            sreq = str(r.get("Required") or "").strip()
-            if sreq and _sbool(sreq) != _obool(om.get("required")):
-                why.append(f"required: sheet={_sbool(sreq)} org={_obool(om.get('required'))}")
-        for scol, ocol in (("Unique", "unique"), ("External ID", "externalId")):
-            sv = str(r.get(scol) or "").strip()
-            if sv and _sbool(sv) != _obool(om.get(ocol)):
-                why.append(f"{ocol}: sheet={_sbool(sv)} org={_obool(om.get(ocol))}")
+        if expect.get("referenceTo") and oref and oref != expect["referenceTo"]:
+            why.append(f"referenceTo: sheet={expect['referenceTo']} org={oref}")
+        if expect.get("picklist") and om.get("_picklist"):
+            if set(expect["picklist"]) != set(om["_picklist"]):
+                why.append(
+                    f"picklist values differ ({len(expect['picklist'])} sheet / "
+                    f"{len(om['_picklist'])} org)")
+        why.extend(secondary_mismatches(expect, om, require_present=False))
         if why:
             od = ot + (" +formula" if ohf else "") + (f" ->{oref}" if oref else "")
             drift.append({"field": api, "sheet": dt, "org": od, "reason": "; ".join(why)})

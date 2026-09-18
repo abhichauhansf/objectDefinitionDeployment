@@ -171,13 +171,71 @@ def object_of(mtype: str, member: str) -> str:
     return member
 
 
+class PackageCapError(ValueError):
+    """An unsplittable dependency closure exceeds ``max_components``."""
+
+    def __init__(self, message: str, *, object_api: str = "", size: int = 0,
+                 cap: int = 0):
+        super().__init__(message)
+        self.object_api = object_api
+        self.size = size
+        self.cap = cap
+
+
+def _group_size(group: dict[str, list]) -> int:
+    return sum(len(v) for v in group.values())
+
+
+def _member_keys(group: dict[str, list]) -> set[tuple[str, str]]:
+    return {(t, m) for t, vals in group.items() for m in vals}
+
+
+def _sorted_group(group: dict[str, list[str]]) -> dict[str, list[str]]:
+    return {k: sorted(v) for k, v in sorted(
+        ((t, vals) for t, vals in group.items() if vals),
+        key=lambda kv: TYPE_ORDER.index(kv[0]) if kv[0] in TYPE_ORDER else 99)}
+
+
+def _closure_error(group: dict[str, list[str]], size: int, cap: int) -> PackageCapError:
+    objs = sorted({object_of(t, m) for t, vals in group.items() for m in vals})
+    obj = objs[0] if len(objs) == 1 else ",".join(objs)
+    bits = [f"{len(v)} {t}" for t, v in _sorted_group(group).items()]
+    msg = (
+        f"Object {obj} dependency closure is {size} component(s) "
+        f"({', '.join(bits)}) which exceeds max_components={cap}. "
+        "Check-only validates each package against the unchanged org, so a new "
+        "object cannot be split from its fields or translations, and a "
+        "CustomObjectTranslation cannot be split from the new fields it "
+        "references. Raise --max-components to at least "
+        f"{size} (Metadata API cap is 10000), or reduce the object's new members."
+    )
+    return PackageCapError(msg, object_api=obj, size=size, cap=cap)
+
+
+def infer_atomic_groups(members: dict[str, list[str]]) -> list[dict[str, list[str]]]:
+    """Conservative closures when the planner did not pass explicit groups.
+
+    Any object that carries CustomObject or CustomObjectTranslation is treated
+    as unsplittable (safe for check-only). Field-only groups may split.
+    """
+    by_object: dict[str, dict[str, list[str]]] = {}
+    for mtype in TYPE_ORDER:
+        for m in members.get(mtype, []):
+            by_object.setdefault(object_of(mtype, m), {}).setdefault(mtype, []).append(m)
+    groups: list[dict[str, list[str]]] = []
+    for obj in sorted(by_object):
+        g = by_object[obj]
+        if g.get("CustomObject") or g.get("CustomObjectTranslation"):
+            groups.append(g)
+    return groups
+
+
 def split_object_group(group: dict[str, list[str]], max_components: int
                        ) -> list[dict[str, list[str]]]:
-    """Packages for ONE object, each at most ``max_components``.
+    """Split a *dependency-free* object group under the component cap.
 
-    ``CustomObject`` is always the first member of the first package so a
-    new object's definition precedes any field part that depends on it.
-    Oversized groups are split rather than emitted as one illegal package.
+    CustomField lists may be chunked. This must NOT be used for a new object's
+    CustomObject+fields+translation closure — those are atomic.
     """
     if max_components <= 0:
         return [group]
@@ -209,22 +267,51 @@ def split_object_group(group: dict[str, list[str]], max_components: int
     return packages
 
 
-def split_members(members: dict[str, list[str]], max_components: int
+def split_members(members: dict[str, list[str]], max_components: int,
+                  atomic_groups: list[dict[str, list[str]]] | None = None
                   ) -> list[dict[str, list[str]]]:
     """Split a member set into deterministic packages under the component cap.
 
-    Members of the same object stay together when they fit. If one object's
-    group exceeds the cap it is split (CustomObject first, then fields, then
-    translations) rather than producing an oversized package.
+    ``atomic_groups`` are dependency closures that must stay in one package
+    because check-only dry-runs each package against the *unchanged* org:
+    a new object's CustomObject+fields+translation, and a translation plus
+    every new field it references. Closures larger than the cap fail instead
+    of producing independently invalid packages. Only leftover field groups
+    (no such dependency) are split.
     """
     total = sum(len(v) for v in members.values())
+    if not total:
+        return []
     if max_components <= 0 or total <= max_components:
-        return [members] if total else []
+        return [members]
+
+    if atomic_groups is None:
+        atomic_groups = infer_atomic_groups(members)
+
+    units: list[dict[str, list[str]]] = []
+    taken: set[tuple[str, str]] = set()
+    for raw in atomic_groups:
+        group = {t: list(vals) for t, vals in raw.items() if vals}
+        size = _group_size(group)
+        if not size:
+            continue
+        if size > max_components:
+            raise _closure_error(group, size, max_components)
+        units.append(group)
+        taken |= _member_keys(group)
+
+    remainder: dict[str, list[str]] = {}
+    for mtype, vals in members.items():
+        left = [m for m in vals if (mtype, m) not in taken]
+        if left:
+            remainder[mtype] = left
 
     by_object: dict[str, dict[str, list[str]]] = {}
     for mtype in TYPE_ORDER:
-        for m in members.get(mtype, []):
+        for m in remainder.get(mtype, []):
             by_object.setdefault(object_of(mtype, m), {}).setdefault(mtype, []).append(m)
+    for obj in sorted(by_object):
+        units.extend(split_object_group(by_object[obj], max_components))
 
     packages: list[dict[str, list[str]]] = []
     current: dict[str, list[str]] = {}
@@ -236,35 +323,30 @@ def split_members(members: dict[str, list[str]], max_components: int
             packages.append(current)
         current, count = {}, 0
 
-    for obj in sorted(by_object):
-        for chunk in split_object_group(by_object[obj], max_components):
-            size = sum(len(v) for v in chunk.values())
-            if size > max_components:
-                raise ValueError(
-                    f"object {obj} produced a {size}-component chunk above "
-                    f"max_components={max_components}; split_object_group must "
-                    "keep every package at or under the cap")
-            if count and count + size > max_components:
-                flush()
-            for mtype, vals in chunk.items():
-                current.setdefault(mtype, []).extend(vals)
-            count += size
+    for unit in units:
+        size = _group_size(unit)
+        if size > max_components:
+            raise _closure_error(unit, size, max_components)
+        if count and count + size > max_components:
+            flush()
+        for mtype, vals in unit.items():
+            current.setdefault(mtype, []).extend(vals)
+        count += size
     flush()
-    return [{k: sorted(v) for k, v in sorted(
-        p.items(),
-        key=lambda kv: TYPE_ORDER.index(kv[0]) if kv[0] in TYPE_ORDER else 99)}
-            for p in packages]
+    return [_sorted_group(p) for p in packages]
 
 
 def plan_parts(members: dict[str, list[str]], max_components: int,
-               stem: str = "package", suffix: str = ".xml") -> list[dict]:
+               stem: str = "package", suffix: str = ".xml",
+               atomic_groups: list[dict[str, list[str]]] | None = None
+               ) -> list[dict]:
     """The manifest INDEX: every package file this member set becomes.
 
     The planner stores this in the plan so the deploy command knows there are
     N packages and deploys every one of them in order. Deploying only
     `package.xml` when the plan split into parts silently drops components.
     """
-    packages = split_members(members, max_components)
+    packages = split_members(members, max_components, atomic_groups=atomic_groups)
     if not packages:
         return []
     if len(packages) == 1:

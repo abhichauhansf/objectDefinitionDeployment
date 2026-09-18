@@ -535,20 +535,66 @@ def test_oversized_existing_object_is_split_by_the_planner():
     print("  ok  oversized-existing-object-is-split-by-the-planner")
 
 
-def test_new_object_customobject_precedes_oversized_field_parts():
-    """A new object's CustomObject must land before any overflow field package."""
+def test_new_object_closure_stays_in_one_package():
+    """A new object's CustomObject + fields stay together when they fit the cap."""
+    rows = [meta_row()] + [
+        field_row(f"TI_Fnt_F{i:02d}__c", f"項目{i}", f"Field {i}")
+        for i in range(3)]
+    plan = plan_for(rows, snapshot(exists=False), lang="off", max_components=10)
+    assert plan["validationErrors"] == []
+    assert len(plan["manifestParts"]) == 1
+    mem = plan["manifestParts"][0]["members"]
+    assert mem.get("CustomObject") == [OBJ]
+    assert len(mem.get("CustomField") or []) == 3
+    print("  ok  new-object-closure-stays-in-one-package")
+
+
+def test_new_object_closure_over_cap_is_a_planning_error():
+    """Splitting a new object would make check-only independently invalid."""
     rows = [meta_row()] + [
         field_row(f"TI_Fnt_F{i:02d}__c", f"項目{i}", f"Field {i}")
         for i in range(3)]
     plan = plan_for(rows, snapshot(exists=False), lang="off", max_components=2)
-    parts = plan["manifestParts"]
-    assert parts[0]["members"].get("CustomObject") == [OBJ]
-    assert all(OBJ not in (p["members"].get("CustomObject") or [])
-               for p in parts[1:])
-    assert all(p["components"] <= 2 for p in parts)
-    fields = [m for p in parts for m in (p["members"].get("CustomField") or [])]
-    assert len(fields) == 3
-    print("  ok  new-object-customobject-precedes-oversized-field-parts")
+    assert any(e["code"] == "PACKAGE_CAP" for e in plan["validationErrors"]), \
+        plan["validationErrors"]
+    assert plan["manifestParts"] == []
+    print("  ok  new-object-closure-over-cap-is-a-planning-error")
+
+
+def test_translation_stays_with_referenced_new_fields():
+    """COT + new fields it translates must share a package; over-cap is an error."""
+    rows = [meta_row()] + [
+        field_row(f"TI_Fnt_F{i:02d}__c", f"項目{i}", f"Field {i}")
+        for i in range(3)]
+    snap = snapshot(fields=[], translations={OBJ: org_cot(OBJ, "en_US", {})})
+    plan = plan_for(rows, snap, max_components=10)
+    assert plan["validationErrors"] == []
+    assert len(plan["manifestParts"]) == 1
+    mem = plan["manifestParts"][0]["members"]
+    assert mem.get("CustomObjectTranslation") == [f"{OBJ}-en_US"]
+    assert len(mem.get("CustomField") or []) == 3
+    over = plan_for(rows, snap, max_components=2)
+    assert any(e["code"] == "PACKAGE_CAP" for e in over["validationErrors"])
+    assert over["manifestParts"] == []
+    print("  ok  translation-stays-with-referenced-new-fields")
+
+
+def test_expected_from_row_includes_secondary_attributes():
+    import attr_drift
+    text = field_row("TI_Fnt_Note__c", "備考", "Note", dtype="Text",
+                     Length="80", Unique="TRUE", **{"External ID": "true"})
+    exp = attr_drift.expected_from_row(text)
+    assert exp["type"] == "Text"
+    assert exp["length"] == 80
+    assert exp["unique"] is True
+    assert exp["externalId"] is True
+    num = field_row("TI_Fnt_Qty__c", "数量", "Qty", dtype="Number",
+                    Precision="18", Scale="2", Required="TRUE")
+    nexp = attr_drift.expected_from_row(num)
+    assert nexp["precision"] == 18
+    assert nexp["scale"] == 2
+    assert nexp["required"] is True
+    print("  ok  expected-from-row-includes-secondary-attributes")
 
 
 # --------------------------------------------------------------------------- #
@@ -968,7 +1014,10 @@ def main() -> int:
         test_empty_plan_yields_empty_manifest,
         test_package_split_is_deterministic_and_grouped,
         test_oversized_existing_object_is_split_by_the_planner,
-        test_new_object_customobject_precedes_oversized_field_parts,
+        test_new_object_closure_stays_in_one_package,
+        test_new_object_closure_over_cap_is_a_planning_error,
+        test_translation_stays_with_referenced_new_fields,
+        test_expected_from_row_includes_secondary_attributes,
         test_performance_100_objects_200_fields,
         test_generation_is_linear_in_entries,
         test_single_canonical_entry_point,

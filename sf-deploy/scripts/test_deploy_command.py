@@ -665,7 +665,13 @@ def test_attribute_updates_are_verified_against_live_metadata():
                 "nameField": {"type": "AutoNumber",
                               "displayFormat": "RCV-{0000000}"},
                 "fields": {"TI_Fnt_Kind__c": {
-                    "type": "Picklist", "formula": False, "picklist": ["A", "B"]}},
+                    "type": "Picklist", "formula": False, "picklist": ["A", "B"]},
+                           "TI_Fnt_Note__c": {
+                    "type": "Text", "formula": False, "length": 80,
+                    "unique": True, "required": True},
+                           "TI_Fnt_Qty__c": {
+                    "type": "Number", "formula": False, "precision": 18,
+                    "scale": 2}},
             }
         }
     }
@@ -676,6 +682,10 @@ def test_attribute_updates_are_verified_against_live_metadata():
         "<sharingModel>ReadWrite</sharingModel>"
         "<nameField><type>Text</type><label>No</label></nameField>"
         "<fields><fullName>TI_Fnt_Kind__c</fullName><type>Checkbox</type></fields>"
+        "<fields><fullName>TI_Fnt_Note__c</fullName><type>Text</type>"
+        "<length>255</length></fields>"
+        "<fields><fullName>TI_Fnt_Qty__c</fullName><type>Number</type>"
+        "<precision>16</precision><scale>0</scale></fields>"
         "</records>")
     landed = (
         f"<records><fullName>{OBJ}</fullName>"
@@ -686,6 +696,10 @@ def test_attribute_updates_are_verified_against_live_metadata():
         "<fields><fullName>TI_Fnt_Kind__c</fullName><type>Picklist</type>"
         "<value><fullName>A</fullName></value>"
         "<value><fullName>B</fullName></value></fields>"
+        "<fields><fullName>TI_Fnt_Note__c</fullName><type>Text</type>"
+        "<length>80</length><unique>true</unique><required>true</required></fields>"
+        "<fields><fullName>TI_Fnt_Qty__c</fullName><type>Number</type>"
+        "<precision>18</precision><scale>2</scale></fields>"
         "</records>")
 
     with patched(verify_deploy, "org_auth", lambda org: auth), \
@@ -696,6 +710,8 @@ def test_attribute_updates_are_verified_against_live_metadata():
         assert any("Name type" in f for f in fails), fails
         assert any("TI_Fnt_Kind__c" in f for f in fails), fails
         assert any("enableHistory" in f for f in fails), fails
+        assert any("length" in f for f in fails), fails
+        assert any("precision" in f for f in fails), fails
 
     with patched(verify_deploy, "org_auth", lambda org: auth), \
             patched(verify_deploy.org_snapshot, "object_snapshot",
@@ -712,6 +728,10 @@ def test_attribute_updates_are_verified_against_live_metadata():
         "<fields><fullName>TI_Fnt_Kind__c</fullName><type>Picklist</type>"
         "<value><fullName>A</fullName></value>"
         "<value><fullName>B</fullName></value></fields>"
+        "<fields><fullName>TI_Fnt_Note__c</fullName><type>Text</type>"
+        "<length>80</length><unique>true</unique><required>true</required></fields>"
+        "<fields><fullName>TI_Fnt_Qty__c</fullName><type>Number</type>"
+        "<precision>18</precision><scale>2</scale></fields>"
         "</records>")
     with patched(verify_deploy, "org_auth", lambda org: auth), \
             patched(verify_deploy.org_snapshot, "object_snapshot",

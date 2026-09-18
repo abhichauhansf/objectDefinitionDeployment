@@ -248,6 +248,8 @@ def _field_attr_failures(obj: str, field: str, expect: dict, om: dict) -> list[s
         if set(expect["picklist"]) != set(got):
             fails.append(
                 f"{loc}: picklist expected={expect['picklist']} org={got}")
+    for msg in attr_drift.secondary_mismatches(expect, om, require_present=True):
+        fails.append(f"{loc}: {msg}")
     return fails
 
 
@@ -256,8 +258,9 @@ def verify_attribute_updates(plan: dict, org: str,
     """Confirm approved definition updates against live CustomObject metadata.
 
     Name-existence is not enough: a type/formula/reference/picklist change, a
-    standard Name type/displayFormat change, or an object history/sharing
-    patch can all exist-as-name while the org still has the old definition.
+    length/precision/required/unique/externalId change, a standard Name
+    type/displayFormat change, or an object history/sharing patch can all
+    exist-as-name while the org still has the old definition.
     """
     expectations = plan.get("attributeExpectations") or {}
     if not expectations:
