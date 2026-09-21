@@ -274,10 +274,11 @@ def split_members(members: dict[str, list[str]], max_components: int,
 
     ``atomic_groups`` are dependency closures that must stay in one package
     because check-only dry-runs each package against the *unchanged* org:
-    a new object's CustomObject+fields+translation, and a translation plus
-    every new field it references. Closures larger than the cap fail instead
-    of producing independently invalid packages. Only leftover field groups
-    (no such dependency) are split.
+    a new object's CustomObject+fields+translation, a translation plus every
+    new field it references, and an existing object's CustomObject patch plus
+    the Master-Detail / history fields that required it. Closures larger than
+    the cap fail instead of producing independently invalid packages. Only
+    leftover field groups (no such dependency) are split.
     """
     total = sum(len(v) for v in members.values())
     if not total:

@@ -579,6 +579,58 @@ def test_translation_stays_with_referenced_new_fields():
     print("  ok  translation-stays-with-referenced-new-fields")
 
 
+def test_master_detail_and_history_stay_with_object_when_fields_split():
+    """Check-only of MD/history fields needs the CustomObject patch in the same package."""
+
+    def part_for(plan: dict, field: str) -> dict:
+        hits = [p for p in plan["manifestParts"]
+                if f"{OBJ}.{field}" in (p["members"].get("CustomField") or [])]
+        assert len(hits) == 1, (field, plan["manifestParts"])
+        return hits[0]
+
+    extras = [field_row("TI_Fnt_A__c", "A"),
+              field_row("TI_Fnt_B__c", "B"),
+              field_row("TI_Fnt_C__c", "C")]
+
+    md_plan = plan_for(
+        [meta_row(),
+         field_row("TI_Fnt_Parent__c", "親", dtype="MasterDetail",
+                   **{"Type Specific Value": "TI_Fnt_Deal__c"}),
+         *extras],
+        snapshot(fields=[]), lang="off", max_components=2)
+    assert md_plan["validationErrors"] == []
+    md_part = part_for(md_plan, "TI_Fnt_Parent__c")
+    assert OBJ in (md_part["members"].get("CustomObject") or []), md_part
+    assert md_part["components"] <= 2
+    free = part_for(md_plan, "TI_Fnt_A__c")
+    assert OBJ not in (free["members"].get("CustomObject") or []), free
+
+    hist_plan = plan_for(
+        [meta_row(),
+         field_row("TI_Fnt_Hist__c", "履歴", **{"Track History": "TRUE"}),
+         *extras],
+        snapshot(fields=[]), lang="off", max_components=2)
+    assert hist_plan["validationErrors"] == []
+    hist_part = part_for(hist_plan, "TI_Fnt_Hist__c")
+    assert OBJ in (hist_part["members"].get("CustomObject") or []), hist_part
+    assert OBJ not in (part_for(hist_plan, "TI_Fnt_A__c")["members"].get(
+        "CustomObject") or [])
+
+    both = plan_for(
+        [meta_row(),
+         field_row("TI_Fnt_Parent__c", "親", dtype="MasterDetail",
+                   **{"Type Specific Value": "TI_Fnt_Deal__c"}),
+         field_row("TI_Fnt_Hist__c", "履歴", **{"Track History": "TRUE"}),
+         *extras],
+        snapshot(fields=[]), lang="off", max_components=3)
+    assert both["validationErrors"] == []
+    both_md = part_for(both, "TI_Fnt_Parent__c")
+    both_hist = part_for(both, "TI_Fnt_Hist__c")
+    assert both_md["file"] == both_hist["file"]
+    assert OBJ in (both_md["members"].get("CustomObject") or [])
+    print("  ok  master-detail-and-history-stay-with-object-when-fields-split")
+
+
 def test_expected_from_row_includes_secondary_attributes():
     import attr_drift
     text = field_row("TI_Fnt_Note__c", "備考", "Note", dtype="Text",
@@ -1017,6 +1069,7 @@ def main() -> int:
         test_new_object_closure_stays_in_one_package,
         test_new_object_closure_over_cap_is_a_planning_error,
         test_translation_stays_with_referenced_new_fields,
+        test_master_detail_and_history_stay_with_object_when_fields_split,
         test_expected_from_row_includes_secondary_attributes,
         test_performance_100_objects_200_fields,
         test_generation_is_linear_in_entries,

@@ -137,11 +137,116 @@ def object_update_reasons(obj: str, new_fields: list[str], rows: list[dict],
     if any(truthy(r.get("Track History")) for r in rows_for) and \
             norm(meta.get("enableHistory")).lower() != "true":
         reasons.append("a new field tracks history; the object needs enableHistory=true")
-    if any("masterdetail" in norm(r.get("Data Type")).lower().replace("-", "").replace(" ", "")
-           or norm(r.get("Data Type")) in ("主従関係",) for r in rows_for) and \
+    if any(_is_master_detail(r) for r in rows_for) and \
             norm(meta.get("sharingModel")) != "ControlledByParent":
         reasons.append("a new Master-Detail field forces sharingModel=ControlledByParent")
     return reasons
+
+
+def _is_master_detail(row: dict) -> bool:
+    dt = (row.get("Data Type") or "").strip()
+    compact = norm(dt).lower().replace("-", "").replace(" ", "")
+    return "masterdetail" in compact or dt in ("主従関係",)
+
+
+def _requires_object_patch(row: dict) -> bool:
+    """True when check-only of this field needs a CustomObject patch in the same package."""
+    return truthy(row.get("Track History")) or _is_master_detail(row)
+
+
+def dependency_closures(
+    members: dict[str, list[str]],
+    new_objects: list[str],
+    created_fields: dict[str, list[str]],
+    translations: list[dict],
+    rows: list[dict],
+) -> list[dict[str, list[str]]]:
+    """Unsplittable check-only closures, merged per object.
+
+    Check-only dry-runs each package against the unchanged org, so these must
+    stay together:
+
+    * a new object's CustomObject + all its fields + translation
+    * a translation + every new field it references
+    * an existing object's CustomObject patch + the Master-Detail / history
+      fields that required it
+    """
+    field_set = set(members.get("CustomField") or [])
+    cot_by_obj: dict[str, list[str]] = {}
+    for m in members.get("CustomObjectTranslation") or []:
+        cot_by_obj.setdefault(
+            build_manifest.object_of("CustomObjectTranslation", m), []).append(m)
+    fields_by_obj: dict[str, list[str]] = {}
+    for m in members.get("CustomField") or []:
+        obj, field = m.split(".", 1)
+        fields_by_obj.setdefault(obj, []).append(m)
+
+    row_by_field: dict[tuple[str, str], dict] = {}
+    for r in rows:
+        obj = norm(r.get("Object API Name"))
+        field = norm(r.get("Field API Name"))
+        if obj and field:
+            row_by_field[(obj, field)] = r
+
+    referenced: dict[str, set[str]] = {}
+    created = {o: set(fs) for o, fs in created_fields.items()}
+    for t in translations:
+        if not t.get("package"):
+            continue
+        obj = norm(t.get("component"))
+        key = norm(t.get("key") or "")
+        field = key.split("::", 1)[0]
+        if field.endswith("__c") and field in created.get(obj, set()):
+            referenced.setdefault(obj, set()).add(field)
+
+    per_obj: dict[str, dict[str, set[str]]] = {}
+
+    def add(obj: str, mtype: str, member: str) -> None:
+        per_obj.setdefault(obj, {}).setdefault(mtype, set()).add(member)
+
+    new_set = set(new_objects)
+    packaged_objects = set(members.get("CustomObject") or [])
+
+    for obj in sorted(new_set):
+        if obj in packaged_objects:
+            add(obj, "CustomObject", obj)
+        for m in fields_by_obj.get(obj) or []:
+            add(obj, "CustomField", m)
+        for m in cot_by_obj.get(obj) or []:
+            add(obj, "CustomObjectTranslation", m)
+
+    for obj, cots in cot_by_obj.items():
+        if obj in new_set:
+            continue
+        needed = [
+            f"{obj}.{f}" for f in referenced.get(obj, ())
+            if f"{obj}.{f}" in field_set]
+        if not needed:
+            continue
+        for m in cots:
+            add(obj, "CustomObjectTranslation", m)
+        for m in needed:
+            add(obj, "CustomField", m)
+
+    for obj in sorted(packaged_objects):
+        if obj in new_set:
+            continue
+        causing = []
+        for m in fields_by_obj.get(obj) or []:
+            field = m.split(".", 1)[1]
+            row = row_by_field.get((obj, field))
+            if row and _requires_object_patch(row):
+                causing.append(m)
+        if not causing:
+            continue
+        add(obj, "CustomObject", obj)
+        for m in causing:
+            add(obj, "CustomField", m)
+
+    groups: list[dict[str, list[str]]] = []
+    for obj in sorted(per_obj):
+        groups.append({t: sorted(v) for t, v in per_obj[obj].items() if v})
+    return groups
 
 
 def build_attribute_expectations(
@@ -188,67 +293,6 @@ def build_attribute_expectations(
         if exp:
             out[obj] = exp
     return out
-
-
-def dependency_closures(
-    members: dict[str, list[str]],
-    new_objects: list[str],
-    created_fields: dict[str, list[str]],
-    translations: list[dict],
-) -> list[dict[str, list[str]]]:
-    """Unsplittable check-only closures: new object + fields + COT, and COT +
-    every new field a packaged translation references.
-
-    Check-only dry-runs each package against the unchanged org, so a field
-    part that assumes a CustomObject just created in the previous part, or a
-    translation part that assumes new fields just created, is independently
-    invalid.
-    """
-    field_set = set(members.get("CustomField") or [])
-    cot_by_obj: dict[str, list[str]] = {}
-    for m in members.get("CustomObjectTranslation") or []:
-        cot_by_obj.setdefault(build_manifest.object_of("CustomObjectTranslation", m), []).append(m)
-    fields_by_obj: dict[str, list[str]] = {}
-    for m in members.get("CustomField") or []:
-        fields_by_obj.setdefault(m.split(".", 1)[0], []).append(m)
-
-    referenced: dict[str, set[str]] = {}
-    created = {o: set(fs) for o, fs in created_fields.items()}
-    for t in translations:
-        if not t.get("package"):
-            continue
-        obj = norm(t.get("component"))
-        key = norm(t.get("key") or "")
-        field = key.split("::", 1)[0]
-        if field.endswith("__c") and field in created.get(obj, set()):
-            referenced.setdefault(obj, set()).add(field)
-
-    groups: list[dict[str, list[str]]] = []
-    new_set = set(new_objects)
-    for obj in sorted(new_set):
-        g: dict[str, list[str]] = {}
-        if obj in (members.get("CustomObject") or []):
-            g["CustomObject"] = [obj]
-        if fields_by_obj.get(obj):
-            g["CustomField"] = sorted(fields_by_obj[obj])
-        if cot_by_obj.get(obj):
-            g["CustomObjectTranslation"] = sorted(cot_by_obj[obj])
-        if g:
-            groups.append(g)
-
-    for obj, cots in sorted(cot_by_obj.items()):
-        if obj in new_set:
-            continue
-        needed = sorted(
-            f"{obj}.{f}" for f in referenced.get(obj, ())
-            if f"{obj}.{f}" in field_set)
-        if not needed:
-            continue
-        groups.append({
-            "CustomField": needed,
-            "CustomObjectTranslation": sorted(cots),
-        })
-    return groups
 
 
 def build_plan(rows: list[dict], snapshot: dict, *, sheet_id: str, tabs: str,
@@ -364,7 +408,7 @@ def build_plan(rows: list[dict], snapshot: dict, *, sheet_id: str, tabs: str,
     members = {k: v for k, v in members.items() if v}
 
     closures = dependency_closures(
-        members, new_objects, created_fields, translations)
+        members, new_objects, created_fields, translations, rows)
     package_errors: list[dict] = []
     try:
         manifest_parts = build_manifest.plan_parts(
