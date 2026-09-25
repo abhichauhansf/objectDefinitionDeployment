@@ -7,8 +7,10 @@ The deploy CLI log is NOT trusted on its own (a stale/dry-run log once reported
 confirms, without manual inspection, that:
 
   1. each expected object exists  (EntityDefinition), and
-  2. each expected TI_Fnt_ field of the generated package is present
-     (FieldDefinition).
+  2. each expected custom field of the generated package is present
+     (Tooling API CustomField, independent of field-level security), and
+  3. with --plan, every planned English translation and Japanese relabel
+     matches the org.
 
 It derives the expected object(s) + field(s) straight from the local generated
 metadata under force-app (the exact thing that was packaged), so there is no
@@ -97,20 +99,110 @@ def org_fields(obj: str, org: str) -> set[str]:
     return {f"{r['DeveloperName']}__c" for r in recs}
 
 
+def org_translation_labels(obj: str, org: str, lang: str = "en_US") -> dict:
+    """Live CustomObjectTranslation labels for exact-English verification."""
+    sys.path.insert(0, str(Path(__file__).resolve().parent))
+    from translate_enrich import jsonable_translation, load_token, parse_object_translation_el, read_metadata
+    tokinfo = load_token(org)
+    recs = read_metadata(
+        "CustomObjectTranslation", [f"{obj}-{lang}"],
+        tokinfo["accessToken"], tokinfo["instanceUrl"].rstrip("/"), tokinfo["apiVersion"])
+    if not recs:
+        return {}
+    rec, raw = recs[0]
+    model = jsonable_translation(parse_object_translation_el(rec, obj, lang, raw_xml=raw))
+    labels = {
+        "__object__": model.get("object_label") or "",
+        "__object_plural__": model.get("object_label_plural") or "",
+        "Name": model.get("name_field_label") or "",
+    }
+    for name, f in (model.get("fields") or {}).items():
+        labels[name] = f.get("label") or ""
+    return labels
+
+
+def verify_translations(plan: dict, org: str) -> bool:
+    """Compare EVERY in-scope sheet English label to the live org.
+
+    Name-existence is not enough: an existing field whose Field Label (EN) or
+    provenance changed must still match. Checking only packaged rows is how a
+    later Google/manual EN edit was reported 'complete' while the org stayed on
+    the previous translation.
+    """
+    skip_codes = {"MISSING_TRANSLATION", "SCHEMA_MISSING", "WIP", "ISDELETE"}
+    entries = []
+    for t in plan.get("translations") or []:
+        if t.get("code") in skip_codes:
+            continue
+        if not (t.get("translation") or "").strip():
+            continue
+        entries.append(t)
+    if not entries:
+        print("      (no sheet English to verify)")
+        return True
+    ok = True
+    from translate_enrich import compare_norm, english_plural_label
+    by_obj: dict[str, list] = {}
+    for t in entries:
+        by_obj.setdefault(t["component"], []).append(t)
+    for obj, obj_entries in by_obj.items():
+        live = org_translation_labels(obj, org, plan.get("language") or "en_US")
+        print(f"\n  [EN] {obj}")
+        for t in obj_entries:
+            expected = (t.get("translation") or "").strip()
+            if t["kind"] == "ObjectLabel":
+                actual = live.get("__object__") or ""
+                loc = "object label"
+            elif t["kind"] == "NameField" or t.get("key") == "Name":
+                actual = live.get("Name") or ""
+                loc = "Name"
+            else:
+                actual = live.get(t["key"]) or ""
+                loc = t["key"]
+            tag = "pkg" if t.get("package") else (t.get("code") or "")
+            if compare_norm(actual) != compare_norm(expected):
+                ok = False
+                print(f"      ✗ {loc}: org {actual!r} != sheet {expected!r}  [{tag}]")
+            else:
+                print(f"      ✓ {loc}: {expected!r}")
+            if t["kind"] == "ObjectLabel":
+                expected_pl = english_plural_label(expected).strip()
+                actual_pl = live.get("__object_plural__") or ""
+                if compare_norm(actual_pl) != compare_norm(expected_pl):
+                    ok = False
+                    print(f"      ✗ object plural: org {actual_pl!r} != {expected_pl!r}  [{tag}]")
+                else:
+                    print(f"      ✓ object plural: {expected_pl!r}")
+    return ok
+
+
 def main() -> int:
     ap = argparse.ArgumentParser(description="Live post-deploy verification")
     ap.add_argument("--target-org", required=True)
     ap.add_argument("--source-root", default="force-app/main/default")
     ap.add_argument("--objects", default="", help="comma-separated <Obj>__c to verify")
     ap.add_argument("--all", action="store_true", help="verify every generated object")
+    ap.add_argument("--plan", default="", help="deploy plan JSON (exact English verification)")
+    ap.add_argument(
+        "--translations-only",
+        action="store_true",
+        help="verify object existence + plan English without reading generated fields",
+    )
     args = ap.parse_args()
 
     only = {o.strip() for o in args.objects.split(",") if o.strip()} or None
     if not only and not args.all:
         print("❌ pass --objects <Api,...> or --all")
         return 2
+    if args.translations_only and not only:
+        print("❌ --translations-only requires --objects <Api,...>")
+        return 2
 
-    expected = expected_from_source(Path(args.source_root), only)
+    expected = (
+        {obj: [] for obj in sorted(only or set())}
+        if args.translations_only
+        else expected_from_source(Path(args.source_root), only)
+    )
     if not expected:
         print("❌ no generated objects found under", args.source_root)
         return 2
@@ -122,7 +214,11 @@ def main() -> int:
     overall_ok = True
     for obj, fields in expected.items():
         obj_ok = org_has_object(obj, args.target_org)
-        present = org_fields(obj, args.target_org) if obj_ok else set()
+        present = (
+            org_fields(obj, args.target_org)
+            if obj_ok and not args.translations_only
+            else set()
+        )
         missing = [f for f in fields if f not in present]
         status = "OK" if (obj_ok and not missing) else "FAIL"
         if status == "FAIL":
@@ -132,6 +228,19 @@ def main() -> int:
         print(f"      fields expected: {len(fields)}  |  present: {len([f for f in fields if f in present])}  |  missing: {len(missing)}")
         for m in missing:
             print(f"        ✗ MISSING field: {m}")
+
+    trans_ok = True
+    if args.plan:
+        plan_path = Path(args.plan)
+        if plan_path.exists():
+            plan = json.loads(plan_path.read_text(encoding="utf-8"))
+            trans_ok = verify_translations(plan, args.target_org)
+            if not trans_ok:
+                overall_ok = False
+            sys.path.insert(0, str(Path(__file__).resolve().parent))
+            from label_sync import verify_labels
+            if not verify_labels(plan, args.target_org):
+                overall_ok = False
 
     print("\n" + "=" * 72)
     print(f"  RESULT: {'ALL CONFIRMED IN ORG' if overall_ok else 'VERIFICATION FAILED — deploy did NOT fully land'}")

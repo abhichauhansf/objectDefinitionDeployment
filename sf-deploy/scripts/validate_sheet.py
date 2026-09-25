@@ -75,6 +75,52 @@ TRUTHY = {"true", "y", "yes", "1", "○", "〇"}
 BOOLEANISH = TRUTHY | {"false", "n", "no", "0", "×", "-", ""}
 
 
+def _te():
+    try:
+        from translate_enrich import LABEL_MAX_LEN, invalid_english, object_en_for_org, norm as _n
+    except ImportError:
+        sys.path.insert(0, str(__import__("pathlib").Path(__file__).resolve().parent))
+        from translate_enrich import LABEL_MAX_LEN, invalid_english, object_en_for_org, norm as _n
+    return LABEL_MAX_LEN, invalid_english, object_en_for_org, _n
+
+
+def _validate_object_header_en(rep: Report, obj: str, obj_ja: str, obj_en: str,
+                               name_ja: str, name_en: str) -> None:
+    """Object English is not rewritten on the sheet. Over-limit header EN → Name EN in org."""
+    max_len, _, object_en_for_org, _n = _te()
+    deploy_en, via = object_en_for_org(obj_en, name_en)
+    if via == "name_en":
+        if not _n(deploy_en):
+            rep.error(obj, "-", "translation.en",
+                      f"object English exceeds Salesforce label limit "
+                      f"({len(_n(obj_en))}>{max_len}) and Name EN is blank")
+            return
+        _validate_translation(rep, obj, "-", name_ja, deploy_en, kind="object")
+        rep.warn(obj, "-", "translation.en",
+                 f"header object English is {len(_n(obj_en))} chars (limit {max_len}); "
+                 f"org will use Name EN {deploy_en!r}; header cells not overwritten")
+        return
+    _validate_translation(rep, obj, "-", obj_ja, obj_en, kind="object")
+
+
+def _validate_translation(rep: Report, obj: str, loc: str, ja: str, en: str, *, kind: str) -> None:
+    """Hard-block blank/invalid English. Never warn-and-continue for in-scope labels."""
+    _, invalid_english, _, _n = _te()
+    ja_n, en_n = _n(ja), _n(en)
+    if not ja_n:
+        # object/name JA blank is already covered by sheet structure; field.label covers fields.
+        if kind != "field":
+            rep.error(obj, loc, "translation.ja", f"{kind} Japanese source label is blank")
+        return
+    if not en_n:
+        rep.error(obj, loc, "translation.en",
+                  f"{kind} English label is blank — cannot deploy without en_US")
+        return
+    reason = invalid_english(en_n, ja=ja_n, api=loc if loc != "-" else obj)
+    if reason:
+        rep.error(obj, loc, "translation.en", f"{kind} English is invalid: {reason}")
+
+
 def truthy(v) -> bool:
     return str(v or "").strip().lower() in TRUTHY
 
@@ -128,6 +174,16 @@ def validate(rows: list[dict], rep: Report, org_objects: set[str] | None = None)
                 rep.error(r.get("Object Label", "?"), "-", "object.api", "Object API Name is blank")
             elif not (API_NAME_RE.match(obj) and obj.endswith("__c")):
                 rep.error(obj, "-", "object.api", f"Object API '{obj}' invalid (must match API name regex and end __c)")
+            obj_en = r.get("Object Label (EN)", "")
+            name_en = r.get("Name Field Label (EN)", "")
+            # Object EN is the header-row Field Label (EN). If it exceeds 40
+            # chars, the org package uses Name EN; header cells are not rewritten.
+            if nonblank(r.get("Object Label", "")):
+                _validate_object_header_en(
+                    rep, obj, r.get("Object Label", ""), obj_en,
+                    r.get("Name Field Label", ""), name_en)
+            _validate_translation(rep, obj, "Name", r.get("Name Field Label", ""),
+                                  name_en, kind="name")
             continue
 
         obj = r.get("Object API Name", "").strip() or r.get("_SheetName", "").strip()
@@ -155,6 +211,9 @@ def validate(rows: list[dict], rep: Report, org_objects: set[str] | None = None)
             seen[(obj, fapi)] += 1
             if seen[(obj, fapi)] == 2:
                 rep.error(obj, fapi, "field.duplicate", f"Duplicate field API '{fapi}' in object '{obj}'")
+
+        if fapi.endswith("__c"):
+            _validate_translation(rep, obj, fapi, label, r.get("Field Label (EN)", ""), kind="field")
 
         # Standard fields (no __c) are never deployed by generate_xml, so their
         # field-definition columns (Length, referenceTo, Precision, etc.) are
@@ -428,6 +487,11 @@ def query_org_objects(target_org: str, ref_names: set[str]) -> set[str]:
                 ["sf", "data", "query", "--target-org", target_org, "--json", "--query", q],
                 capture_output=True, text=True, timeout=120)
             data = json.loads(cp.stdout or "{}")
+            if data.get("status") not in (0, None):
+                msg = data.get("message") or data.get("name") or "unknown"
+                print(f"⚠️  org referenceTo check failed ({msg}) — skipping org existence "
+                      f"validation for this run.")
+                return None  # signal: could not check (do not fail-closed)
             for rec in data.get("result", {}).get("records", []) or []:
                 present.add(str(rec.get("QualifiedApiName", "")).lower())
         except Exception as e:

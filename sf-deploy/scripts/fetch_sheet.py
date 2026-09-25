@@ -40,6 +40,11 @@ warnings.filterwarnings("ignore")
 # --------------------------------------------------------------------------- #
 API_HEADER_TO_KEY = {
     "label": "Field Label",
+    "field label (en)": "Field Label (EN)",
+    "translation provenance": "Translation Provenance",
+    "translation origin": "Translation Origin",
+    "translation source hash": "Translation Source Hash",
+    "translation generated at": "Translation Generated At",
     "fullname": "Field API Name",
     "type": "Data Type",
     "length": "Length",
@@ -175,6 +180,26 @@ def is_object_tab(title: str) -> bool:
     return title.strip().lower() not in {t.lower() for t in NON_OBJECT_TABS}
 
 
+def parse_tab_list(raw: str) -> list[str]:
+    """Split `--tabs` the same way as the rest of this repo: comma-separated titles."""
+    return [t.strip() for t in str(raw or "").split(",") if t.strip()]
+
+
+def unpack_packed(rec: dict, packed_key: str, origin_key: str,
+                  hash_key: str, gen_key: str) -> None:
+    """Split a packed `origin | hash | generated-at` cell into the row dict."""
+    packed = str(rec.get(packed_key) or "").strip()
+    if not packed:
+        return
+    parts = [p.strip() for p in packed.split("|")]
+    if not str(rec.get(origin_key) or "").strip() and parts:
+        rec[origin_key] = parts[0]
+    if not str(rec.get(hash_key) or "").strip() and len(parts) > 1:
+        rec[hash_key] = parts[1]
+    if not str(rec.get(gen_key) or "").strip() and len(parts) > 2:
+        rec[gen_key] = parts[2]
+
+
 def find_header_row(grid: list[list]) -> int | None:
     """Return 0-based index of the API header row (has 'fullName' and 'type')."""
     for i, row in enumerate(grid[:20]):
@@ -219,6 +244,19 @@ def build_col_map(header_row: list, jp_header_row: list | None = None) -> dict[i
         if "デフォルト" in jph:                    # デフォルト値  (col L)
             col_map[idx] = "Default Value"
             continue
+        # English label / provenance (header-driven; JP or EN header text).
+        jph_l = jph.lower()
+        if ("ラベル" in jph and "(en)" in jph_l) or "項目ラベル名 (en)" in jph_l:
+            col_map[idx] = "Field Label (EN)"
+            continue
+        if "翻訳出典" in jph or h in ("translation provenance",):
+            col_map[idx] = "Translation Provenance"
+            continue
+        if h in ("field label (en)", "translation provenance",
+                 "translation origin", "translation source hash",
+                 "translation generated at"):
+            col_map[idx] = API_HEADER_TO_KEY[h]
+            continue
         # 2) The 'displayFormat/referenceTo/formula/valueSet' header sits on the
         #    DESCRIPTION column (col G) in this sheet — do NOT read it as the
         #    value (client's real value is col H, handled above).
@@ -230,6 +268,27 @@ def build_col_map(header_row: list, jp_header_row: list | None = None) -> dict[i
     return col_map
 
 
+OBJECT_META_LABELS = {
+    "表示ラベル", "オブジェクト名", "説明", "レポートを許可", "活動を許可",
+    "項目履歴管理", "検索を許可", "タブ作成 (create tab)",
+    "表示ラベル (EN)", "表示ラベル(EN)", "Object Label (EN)",
+    "Object Translation Provenance", "Object Translation Origin",
+    "Object Translation Source Hash", "Object Translation Generated At",
+}
+
+
+def _meta_value(cells: list[str], start: int) -> str:
+    """Read within one object-header region, stopping at the next label."""
+    known = {norm(x).rstrip(":").lower() for x in OBJECT_META_LABELS}
+    for value in cells[start:]:
+        clean = norm(value)
+        if clean.rstrip(":").lower() in known:
+            return ""
+        if clean and not clean.endswith(":"):
+            return clean
+    return ""
+
+
 def parse_object_header(grid: list[list], header_idx: int) -> dict:
     """Extract object-level metadata (rows above the field header row).
 
@@ -238,18 +297,32 @@ def parse_object_header(grid: list[list], header_idx: int) -> dict:
     meta = {"_type": "object_meta"}
     label = api = desc = ""
     er = ea = eh = es = ""
-    for row in grid[:header_idx]:
+    # Object-meta only: stop before the JP field-header row so field-column
+    # labels (翻訳出典, 項目ラベル名 (EN)) are never read as object EN/provenance.
+    meta_end = max(header_idx - 1, 0)
+    for ridx, row in enumerate(grid[:meta_end]):
         cells = [norm(c) for c in row]
         joined = [c for c in cells]
         for j, c in enumerate(cells):
-            if c == "表示ラベル":
-                label = _first_nonblank(joined, j + 1)
+            if c in ("表示ラベル (EN)", "表示ラベル(EN)", "Object Label (EN)"):
+                meta["Object Label (EN)"] = _meta_value(joined, j + 1)
+            elif c in ("Object Translation Provenance",):
+                meta["Object Translation Provenance"] = _meta_value(joined, j + 1)
+            elif c in ("Object Translation Origin",):
+                meta["Object Translation Origin"] = _meta_value(joined, j + 1)
+            elif c in ("Object Translation Source Hash",):
+                meta["Object Translation Source Hash"] = _meta_value(joined, j + 1)
+            elif c in ("Object Translation Generated At",):
+                meta["Object Translation Generated At"] = _meta_value(joined, j + 1)
+            elif c == "表示ラベル":
+                label = _meta_value(joined, j + 1)
+                meta["_ObjectHeaderRow"] = ridx
                 # オブジェクト名 label is usually further right on the same row
                 if "オブジェクト名" in cells:
                     k = cells.index("オブジェクト名")
-                    api = _first_nonblank(joined, k + 1)
+                    api = _meta_value(joined, k + 1)
             elif c == "説明":
-                desc = _first_nonblank(joined, j + 1)
+                desc = _meta_value(joined, j + 1)
             elif c == "レポートを許可":
                 # value row is typically the next grid row; handled below
                 pass
@@ -282,14 +355,14 @@ def parse_object_header(grid: list[list], header_idx: int) -> dict:
         "enableHistory": eh,
         "enableSearch": es,
     })
+    unpack_packed(
+        meta,
+        packed_key="Object Translation Provenance",
+        origin_key="Object Translation Origin",
+        hash_key="Object Translation Source Hash",
+        gen_key="Object Translation Generated At",
+    )
     return meta
-
-
-def _first_nonblank(cells: list[str], start: int) -> str:
-    for c in cells[start:]:
-        if norm(c):
-            return norm(c)
-    return ""
 
 
 def parse_tab(title: str, grid: list[list], object_api_hint: str = "") -> list[dict]:
@@ -309,6 +382,26 @@ def parse_tab(title: str, grid: list[list], object_api_hint: str = "") -> list[d
     obj_meta["Object API Name"] = obj_api
     obj_meta["Object Label"] = obj_label
 
+    # Object EN/provenance live on the object-header row (表示ラベル), in the
+    # Field Label (EN) / Translation Provenance columns — not a field row.
+    oh = obj_meta.get("_ObjectHeaderRow")
+    if oh is not None and 0 <= int(oh) < len(grid):
+        hdr_cells = [norm(c) for c in grid[int(oh)]]
+        en_idx = next((i for i, k in col_map.items() if k == "Field Label (EN)"), None)
+        pv_idx = next((i for i, k in col_map.items() if k == "Translation Provenance"), None)
+        if en_idx is not None and not obj_meta.get("Object Label (EN)"):
+            obj_meta["Object Label (EN)"] = hdr_cells[en_idx] if en_idx < len(hdr_cells) else ""
+        if pv_idx is not None and not obj_meta.get("Object Translation Provenance"):
+            obj_meta["Object Translation Provenance"] = (
+                hdr_cells[pv_idx] if pv_idx < len(hdr_cells) else "")
+        unpack_packed(
+            obj_meta,
+            packed_key="Object Translation Provenance",
+            origin_key="Object Translation Origin",
+            hash_key="Object Translation Source Hash",
+            gen_key="Object Translation Generated At",
+        )
+
     rows: list[dict] = []
     field_rows: list[dict] = []
     name_field = {}
@@ -319,15 +412,23 @@ def parse_tab(title: str, grid: list[list], object_api_hint: str = "") -> list[d
         idx = helper[key]
         return cells[idx].strip() if idx < len(cells) else ""
 
-    for row in grid[header_idx + 1:]:
+    for ridx, row in enumerate(grid[header_idx + 1:], start=header_idx + 1):
         cells = [norm(c) for c in row]
         # stop at the end of the FIELD list — END[項目] (col A) or the legacy
         # gray-guard line (col C). Shared helper so the boundary never drifts.
         if is_field_list_end(cells):
             break
-        rec = {"_SheetName": title, "Object API Name": obj_api, "Object Label": obj_label}
+        rec = {"_SheetName": title, "Object API Name": obj_api, "Object Label": obj_label,
+               "_SheetRow": ridx + 1}
         for idx, key in col_map.items():
             rec[key] = cells[idx] if idx < len(cells) else ""
+        unpack_packed(
+            rec,
+            packed_key="Translation Provenance",
+            origin_key="Translation Origin",
+            hash_key="Translation Source Hash",
+            gen_key="Translation Generated At",
+        )
         # capture page-layout Tab (Z) + section (AA) for downstream page work
         rec["Tab"] = cell_at(cells, "tab")
         rec["Section"] = cell_at(cells, "section")
@@ -348,13 +449,19 @@ def parse_tab(title: str, grid: list[list], object_api_hint: str = "") -> list[d
         if norm(rec.get("Field API Name")) == "Name":
             name_field = {
                 "Name Field Label": rec.get("Field Label", ""),
+                "Name Field Label (EN)": rec.get("Field Label (EN)", ""),
                 "Name Field Type": rec.get("Data Type", ""),
                 "Name Field Display Format": rec.get("Type Specific Value", ""),
+                "Name Translation Provenance": rec.get("Translation Provenance", ""),
+                "Name Translation Origin": rec.get("Translation Origin", ""),
+                "Name Translation Source Hash": rec.get("Translation Source Hash", ""),
+                "Name Translation Generated At": rec.get("Translation Generated At", ""),
             }
             continue
         field_rows.append(rec)
 
     obj_meta.update(name_field)
+    obj_meta["_SheetName"] = title
     if obj_api:
         rows.append(obj_meta)
     else:
@@ -410,7 +517,13 @@ def main() -> int:
         return 0
 
     if args.tabs.strip():
-        wanted = [t.strip() for t in args.tabs.split(",") if t.strip()]
+        wanted = parse_tab_list(args.tabs)
+        missing = [t for t in wanted if t not in all_titles]
+        if missing:
+            print(f"❌ unknown tab(s): {', '.join(missing)}")
+            obj_tabs = [t for t in all_titles if is_object_tab(t)]
+            print(f"   available object tabs: {', '.join(obj_tabs)}")
+            return 1
     else:
         wanted = [t for t in all_titles if is_object_tab(t)]
 

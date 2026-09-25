@@ -9,9 +9,7 @@ keeping EVERY existing safety gate in place:
   * validation gate            — build stops unless validate_sheet reports 0 ERRORs
   * object-existence pre-check  — live, per object (rule sf-object-existence-precheck)
   * check-only dry-run          — writes nothing to the org
-  * SHOOT deploy gate           — a REAL deploy only runs in --phase deploy, which
-                                  the assistant may invoke ONLY after the user typed
-                                  SHOOT (this script never bypasses that)
+  * explicit deploy phase        — a REAL deploy runs only with --phase deploy
   * live post-deploy verify     — verify_deploy.py (Tooling API, FLS-independent)
   * report refresh              — build_object_report.py tab per object (mandatory)
 
@@ -20,19 +18,23 @@ together, packaged into ONE manifest, and deployed in ONE `deploy start`, then
 verified + reported per object. N CLI round-trips collapse to ~1.
 
 Two phases:
-  --phase build   (default, NO org writes): fetch, patch, validate, generate,
-                  manifest, existence pre-check, and a check-only dry-run.
+  --phase build   (default, NO org writes): fetch, translate-enrich, validate,
+                  plan, generate, manifest, existence pre-check, check-only.
   --phase deploy  (GATED): re-runs build steps (idempotent) then the REAL
                   `deploy start`, live verification, and report refresh.
+
+Translations (object / Name / custom-field English labels) are produced,
+validated, planned, deployed, and verified through THIS command. There is no
+parallel translation pipeline.
 
 Usage:
   # safe: prepare + validate + dry-run a batch (no org writes)
   python scripts/prep_deploy.py --org ERPDEV01 \
       --tabs "諸掛明細: Sales_IncidentalExpensesDetail,単独諸掛:Sales_StandaloneIncidentalExpenses"
 
-  # REAL deploy of the same batch (assistant runs this only after SHOOT)
   python scripts/prep_deploy.py --org ERPDEV01 --phase deploy \
-      --tabs "諸掛明細: Sales_IncidentalExpensesDetail,単独諸掛:Sales_StandaloneIncidentalExpenses"
+      --tabs "諸掛明細: Sales_IncidentalExpensesDetail,単独諸掛:Sales_StandaloneIncidentalExpenses" \
+      --apply-translations
 """
 from __future__ import annotations
 
@@ -44,11 +46,18 @@ import subprocess
 import sys
 from pathlib import Path
 
+from secret_resolver import isolated_child_env
+
 DEFAULT_SHEET_ID = "1_TaxDe-Qxl8BAUmuZc01vUoxpBEPxJ4Opx4tEe8ulNQ"
 OBJECTS_ROOT = Path("force-app/main/default/objects")
+TRANSLATIONS_ROOT = Path("force-app/main/default/objectTranslations")
 VALIDATION_REPORT = Path(".build/validation_report.json")
 PACKAGE = Path("manifest/package.xml")
 LAST_DEPLOY_LOG = Path(".build/last_deploy.log")
+DEPLOY_PLAN = Path(".build/deploy_plan.json")
+ORG_SNAPSHOT = Path(".build/org_snapshot.json")
+TRANSLATION_PREVIEW = Path(".build/translation_preview.json")
+SYNC_STATE = Path(".build/translation_sync_state.json")
 
 
 # --------------------------------------------------------------------------- #
@@ -56,19 +65,23 @@ LAST_DEPLOY_LOG = Path(".build/last_deploy.log")
 # shim (keychain-linked) so the sf CLI can write its lock/cache files.
 # --------------------------------------------------------------------------- #
 def google_env(args) -> dict:
-    e = os.environ.copy()
+    e = isolated_child_env(allow_google_credentials=True)
     e["HOME"] = args.google_home
     e.pop("XDG_DATA_HOME", None)
     return e
 
 
 def sf_env(args) -> dict:
-    e = os.environ.copy()
+    e = isolated_child_env()
     e["HOME"] = args.sf_home
     e["XDG_DATA_HOME"] = args.xdg_data_home
     e["SF_DISABLE_LOG_FILE"] = "true"
     e["SFDX_DISABLE_LOG_FILE"] = "true"
     return e
+
+
+def generic_env() -> dict:
+    return isolated_child_env()
 
 
 def run(cmd: list[str], env: dict, *, capture: bool = False, check: bool = True) -> subprocess.CompletedProcess:
@@ -141,29 +154,104 @@ def validation_error_count() -> int:
         return -1
 
 
-def build_phase(args, temp_path: Path) -> tuple[list[str], dict[str, str]]:
+def tooling_fields(obj: str, args) -> set[str]:
+    recs = soql(
+        "SELECT DeveloperName FROM CustomField "
+        f"WHERE EntityDefinition.QualifiedApiName='{obj}'",
+        args, tooling=True)
+    return {f"{r['DeveloperName']}__c" for r in recs}
+
+
+def build_phase(args, temp_path: Path) -> tuple[list[str], dict[str, str], dict]:
     print("=" * 72)
     print(f"  BUILD PHASE (no org writes)   org={args.org}")
     print("=" * 72)
 
-    # 1) fetch all target tabs together (Google creds)
-    print("\n[1/6] fetch sheet tabs")
+    sys.path.insert(0, "scripts")
+    from fetch_sheet import parse_tab_list
+    tab_list = parse_tab_list(args.tabs)
+    if not tab_list:
+        raise SystemExit("❌ --tabs is required (comma-separated, e.g. Deal,Shipping).")
+
+    # 1) fetch all target tabs together
+    print("\n[1/8] fetch sheet tabs (selected --tabs only)")
     run(["python3", "scripts/fetch_sheet.py",
          "--spreadsheet-id", args.sheet_id, "--tabs", args.tabs,
          "--out", str(temp_path)], google_env(args), capture=True)
 
-    # 2) patch object API names -> __c ; derive object->tab map
-    print("\n[2/6] patch object API names (__c)")
+    # 2) automatic translation enrichment (DeepL or Google — one provider/batch)
+    print("\n[2/8] translation enrichment (JA → en_US)")
+    from translate_enrich import (
+        NEEDS_CONFIRMATION, TranslationAbort, merge_into_rows, preview, run_enrichment,
+        org_id_from_display, plan_has_members, save_sync_state,
+        build_plan, snapshot_translations, write_plan, print_delta,
+    )
+    from label_sync import (
+        add_label_members, apply_label_patches, label_deltas, print_label_delta,
+        save_snapshot as save_label_snapshot, sheet_master_labels, snapshot_master_labels,
+    )
+
+    rows = json.loads(temp_path.read_text(encoding="utf-8"))
+    try:
+        enr = run_enrichment(
+            spreadsheet_id=args.sheet_id,
+            tabs=tab_list,
+            rows=rows,
+            apply=bool(args.apply_translations),
+            force_provider=args.force_provider,
+        )
+    except TranslationAbort as e:
+        print(e)
+        raise SystemExit(1) from e
+
+    TRANSLATION_PREVIEW.parent.mkdir(parents=True, exist_ok=True)
+    preview_payload = {
+        "provider": enr.provider,
+        "tabs": enr.tabs,
+        "spreadsheet_id": enr.spreadsheet_id,
+        "headers_to_create": enr.headers_to_create,
+        "writes": [w.__dict__ if hasattr(w, "__dict__") else w for w in enr.writes],
+        "translated": enr.translated,
+        "backfilled": enr.backfilled,
+        "objects_affected": enr.objects_affected,
+        "fields_affected": enr.fields_affected,
+    }
+    TRANSLATION_PREVIEW.write_text(json.dumps(preview_payload, ensure_ascii=False, indent=2),
+                                   encoding="utf-8")
+    print(preview(enr))
+    if enr.writes and not args.apply_translations:
+        raise SystemExit(
+            f"⛔ translation batch requires confirmation ({len(enr.writes)} cell(s)). "
+            f"Preview: {TRANSLATION_PREVIEW}\n"
+            f"Re-run the SAME command with --apply-translations after confirming. "
+            f"exit={NEEDS_CONFIRMATION}"
+        )
+
+    if enr.applied or enr.rows_patch:
+        rows = merge_into_rows(rows, enr.rows_patch)
+        temp_path.write_text(json.dumps(rows, ensure_ascii=False, indent=2), encoding="utf-8")
+        # Re-fetch selected tabs so calculated Google values (and provenance)
+        # are what validation/planning see — never the formula text.
+        if enr.applied:
+            run(["python3", "scripts/fetch_sheet.py",
+                 "--spreadsheet-id", args.sheet_id, "--tabs", args.tabs,
+                 "--out", str(temp_path)], google_env(args), capture=True)
+            # Overlay calculated EN from enrichment (Sheets formatted values)
+            fetched = json.loads(temp_path.read_text(encoding="utf-8"))
+            fetched = merge_into_rows(fetched, enr.rows_patch)
+            temp_path.write_text(json.dumps(fetched, ensure_ascii=False, indent=2),
+                                 encoding="utf-8")
+
+    # 3) patch object API names -> __c ; derive object->tab map
+    print("\n[3/8] patch object API names (__c)")
     tab_of = patch_object_apis(temp_path)
     objs = object_list(temp_path)
     if not objs:
         raise SystemExit("❌ no objects parsed from the sheet — check --tabs names.")
     print(f"      objects: {', '.join(objs)}")
 
-    # 3) validation gate (with LIVE referenceTo org-existence check — catches a
-    #    Lookup/MasterDetail pointing at an object that doesn't exist in the org,
-    #    e.g. the X__c-vs-XMaster__c shorthand; see KB 2026-08-26).
-    print("\n[3/6] validate (gate: 0 errors, incl. live referenceTo org check)")
+    # 4) validation gate (existing + translation) BEFORE any metadata generation
+    print("\n[4/8] validate (gate: 0 errors, incl. translation + live referenceTo)")
     run(["python3", "scripts/validate_sheet.py",
          "--in", str(temp_path), "--json", str(VALIDATION_REPORT),
          "--target-org", args.org],
@@ -174,23 +262,73 @@ def build_phase(args, temp_path: Path) -> tuple[list[str], dict[str, str]]:
                          f"See {VALIDATION_REPORT}")
     print("      validation PASS")
 
-    # 4) regenerate metadata for the target objects
-    print("\n[4/6] generate metadata XML")
-    for o in objs:
-        shutil.rmtree(OBJECTS_ROOT / o, ignore_errors=True)
-    run(["python3", "scripts/generate_xml.py"], os.environ.copy(), capture=True)
-
-    # 5) build ONE manifest for the whole batch
-    print("\n[5/6] build manifest (single package for the batch)")
-    run(["python3", "scripts/build_manifest.py",
-         "--out", str(PACKAGE), "--only", ",".join(objs)],
-        os.environ.copy(), capture=True)
-
-    # 6) existence pre-check + check-only dry-run
-    print("\n[6/6] object-existence pre-check + check-only dry-run")
+    # 5) one fresh org snapshot + immutable plan
+    print("\n[5/8] org snapshot + delta plan (schema + translations)")
     inlist = "','".join(objs)
     present = {r["QualifiedApiName"] for r in
                soql(f"SELECT QualifiedApiName FROM EntityDefinition WHERE QualifiedApiName IN ('{inlist}')", args)}
+    present_fields = {o: (tooling_fields(o, args) if o in present else set()) for o in objs}
+    org_id = org_id_from_display(args.org)
+    org_t = snapshot_translations(list(present), args.org)
+    ORG_SNAPSHOT.parent.mkdir(parents=True, exist_ok=True)
+    ORG_SNAPSHOT.write_text(json.dumps({
+        "org": args.org, "orgId": org_id, "objects": sorted(present),
+        "fields": {k: sorted(v) for k, v in present_fields.items()},
+        "translations": org_t,
+    }, ensure_ascii=False, indent=2), encoding="utf-8")
+
+    rows = json.loads(temp_path.read_text(encoding="utf-8"))
+    plan = build_plan(
+        rows=rows, org=args.org, org_id=org_id, tabs=tab_list,
+        provider=enr.provider, present_objects=present,
+        present_fields=present_fields, org_translations=org_t,
+    )
+    # Japanese labels: the sheet is master, so any org-side edit is overwritten.
+    org_masters = snapshot_master_labels(sorted(present), args.org)
+    save_label_snapshot(org_masters)
+    add_label_members(plan, label_deltas(sheet_master_labels(rows), org_masters, present))
+    write_plan(plan, DEPLOY_PLAN)
+    print(f"      provider={plan.get('provider')}  empty={plan.get('empty')}  "
+          f"members={ {k: len(v) for k, v in (plan.get('members') or {}).items()} }")
+    print_delta(plan)
+    print_label_delta(plan)
+
+    if plan.get("empty"):
+        print("\n[5b] live English check (existing fields — name-delta is not enough)")
+        cp = subprocess.run(
+            ["python3", "scripts/verify_deploy.py", "--target-org", args.org,
+             "--objects", ",".join(objs), "--plan", str(DEPLOY_PLAN),
+             "--translations-only"],
+            env=sf_env(args), text=True)
+        if cp.returncode != 0:
+            raise SystemExit(
+                "⛔ sheet English differs from the org on an existing field. "
+                "That is a translation delta and must be packaged — not an empty plan.")
+        print("\n" + "-" * 72)
+        print("  BUILD OK — empty plan (unchanged sheet + org). No metadata, no deploy.")
+        print("-" * 72)
+        return objs, tab_of, plan
+
+    # 6) regenerate metadata for planned objects/fields + translations
+    print("\n[6/8] generate metadata XML (schema + translations from plan)")
+    for o in objs:
+        shutil.rmtree(OBJECTS_ROOT / o, ignore_errors=True)
+        shutil.rmtree(TRANSLATIONS_ROOT / f"{o}-en_US", ignore_errors=True)
+    run(["python3", "scripts/generate_xml.py"], generic_env(), capture=True)
+    run(["python3", "scripts/generate_object_translation.py",
+         "--plan", str(DEPLOY_PLAN), "--org-snapshot", str(ORG_SNAPSHOT)],
+        generic_env(), capture=True)
+    for patched in apply_label_patches(plan, org_masters, OBJECTS_ROOT):
+        print(f"      JA label patch (org definition + sheet label): {patched}")
+
+    # 7) manifest FROM THE PLAN (not a directory scan)
+    print("\n[7/8] build manifest from immutable plan")
+    run(["python3", "scripts/build_manifest.py",
+         "--out", str(PACKAGE), "--plan", str(DEPLOY_PLAN)],
+        generic_env(), capture=True)
+
+    # 8) existence pre-check + check-only dry-run
+    print("\n[8/8] object-existence pre-check + check-only dry-run")
     for o in objs:
         print(f"      {'EXISTS ' if o in present else 'NEW    '} {o}"
               + ("" if o in present else "  (object + fields will be created)"))
@@ -201,13 +339,8 @@ def build_phase(args, temp_path: Path) -> tuple[list[str], dict[str, str]]:
          "--validation-report", str(VALIDATION_REPORT)],
         sf_env(args), capture=True)
 
-    # 6b) attribute-level drift for EXISTING objects — the name-based delta only
-    #     checks whether a field EXISTS; this compares the sheet's DEFINITION
-    #     (type / formula / referenceTo / picklist) against the org's ACTUAL
-    #     metadata for fields present in both, surfacing changed-but-existing
-    #     fields the delta would otherwise silently skip. Report-only (never
-    #     blocks the build): type changes usually need a delete+recreate decision.
-    print("\n[6b] attribute-drift check (existing objects: sheet definition vs org)")
+    # 8b) attribute-level drift for EXISTING objects
+    print("\n[8b] attribute-drift check (existing objects: sheet definition vs org)")
     total_drift = 0
     for o in objs:
         if o not in present:
@@ -229,40 +362,75 @@ def build_phase(args, temp_path: Path) -> tuple[list[str], dict[str, str]]:
 
     print("\n" + "-" * 72)
     print("  BUILD OK — validated, packaged, dry-run PASSED (nothing written to org).")
-    print("  To deploy for real (GATED): after the user types SHOOT, run again with")
-    print("     --phase deploy   (same --tabs/--org).")
+    print("  To deploy for real: run again with --phase deploy (same --tabs/--org")
+    print("     and --apply-translations if a translation write was already confirmed).")
     print("-" * 72)
-    return objs, tab_of
+    return objs, tab_of, plan
 
 
-def deploy_phase(args, temp_path: Path, objs: list[str], tab_of: dict[str, str]) -> int:
+def deploy_phase(args, temp_path: Path, objs: list[str], tab_of: dict[str, str],
+                 plan: dict) -> int:
     print("=" * 72)
     print(f"  DEPLOY PHASE (REAL — writes to org)   org={args.org}")
     print("=" * 72)
 
+    if plan.get("empty"):
+        print("  empty package — no metadata write. Still verifying sheet English vs org.")
+        cp = subprocess.run(
+            ["python3", "scripts/verify_deploy.py", "--target-org", args.org,
+             "--objects", ",".join(objs), "--plan", str(DEPLOY_PLAN),
+             "--translations-only"],
+            env=sf_env(args), text=True)
+        if cp.returncode != 0:
+            raise SystemExit(
+                "⛔ VERIFICATION FAILED — sheet English still differs from the org "
+                "(existing-field label/provenance edits are a translation delta, "
+                "not a new-field delta). Do not report success.")
+        print("=" * 72)
+        return 0
+
+    sys.path.insert(0, "scripts")
+    from translate_enrich import save_sync_state
+
     # REAL deploy of the single batch package
     print("\n[1/3] real deploy (sf project deploy start)")
-    run(["python3", "scripts/deploy.py", "--start",
-         "--package", str(PACKAGE), "--target-org", args.org,
-         "--test-level", args.test_level,
-         "--validation-report", str(VALIDATION_REPORT)],
-        sf_env(args), capture=True)
-    # sanity: the log must be a real start, not a stale dry-run
+    try:
+        run(["python3", "scripts/deploy.py", "--start",
+             "--package", str(PACKAGE), "--target-org", args.org,
+             "--test-level", args.test_level,
+             "--validation-report", str(VALIDATION_REPORT)],
+            sf_env(args), capture=True)
+    except SystemExit:
+        print("\n⛔ Salesforce deploy failed AFTER sheet translations were written.")
+        print("   English + provenance are RETAINED on the sheet.")
+        print("   Translation sync state is NOT marked complete.")
+        print("   Set affected fields' Deployment Status to Not Deployed and retry")
+        print("   through this same command (unchanged Japanese will not be retranslated).")
+        raise
+
     first = LAST_DEPLOY_LOG.read_text(encoding="utf-8").splitlines()[0] if LAST_DEPLOY_LOG.exists() else ""
     if "deploy start" not in first or "--dry-run" in first:
         raise SystemExit(f"❌ deploy log is not a real 'deploy start' run:\n  {first}")
 
-    # MANDATORY live verification (Tooling API, FLS-independent)
-    print("\n[2/3] live verification (verify_deploy.py, Tooling API)")
+    print("\n[2/3] live verification (objects, fields, exact English labels)")
     cp = subprocess.run(
         ["python3", "scripts/verify_deploy.py", "--target-org", args.org,
-         "--objects", ",".join(objs)],
+         "--objects", ",".join(objs), "--plan", str(DEPLOY_PLAN)],
         env=sf_env(args), text=True)
     if cp.returncode != 0:
+        print("\n⛔ VERIFICATION FAILED — translations stay on the sheet; sync is NOT complete.")
         raise SystemExit("⛔ VERIFICATION FAILED — the deploy did NOT fully land. "
                          "Do not report success; investigate before retrying.")
 
-    # report refresh per object (mandatory) — non-fatal if it errors
+    to_sync = [t for t in (plan.get("translations") or [])
+               if (t.get("translation") or "").strip()
+               and t.get("code") not in {"MISSING_TRANSLATION", "SCHEMA_MISSING",
+                                         "WIP", "ISDELETE"}]
+    if to_sync:
+        save_sync_state(SYNC_STATE, plan.get("orgId") or args.org, to_sync)
+        print(f"      translation sync state written for orgId={plan.get('orgId')} "
+              f"({len(to_sync)} label(s))")
+
     print("\n[3/3] refresh deployment report tabs")
     for o in objs:
         tab = tab_of.get(o, "")
@@ -293,19 +461,22 @@ def main() -> int:
     ap.add_argument("--out", default="temp_updates.json")
     ap.add_argument("--workbook", default="reports/Object_Deployment_Report.xlsx")
     ap.add_argument("--google-home", default=os.environ.get("SEAP_GOOGLE_HOME", str(Path.home())))
-    ap.add_argument("--sf-home", default=str(Path(".sfhome").resolve()))
+    ap.add_argument("--sf-home", default=os.environ.get("HOME", str(Path.home())))
     ap.add_argument("--xdg-data-home", default=str(Path.home() / ".local" / "share"))
+    ap.add_argument("--apply-translations", action="store_true",
+                    help="write the confirmed translation batch (gated sheet write)")
+    ap.add_argument("--force-provider", default="", choices=["", "deepl", "google"],
+                    help="force DeepL or Google for this batch")
     args = ap.parse_args()
 
     temp_path = Path(args.out)
 
-    # Build always runs first (idempotent) so deploy has a fresh, validated package.
-    objs, tab_of = build_phase(args, temp_path)
+    objs, tab_of, plan = build_phase(args, temp_path)
 
     if args.phase == "build":
         return 0
 
-    return deploy_phase(args, temp_path, objs, tab_of)
+    return deploy_phase(args, temp_path, objs, tab_of, plan)
 
 
 if __name__ == "__main__":

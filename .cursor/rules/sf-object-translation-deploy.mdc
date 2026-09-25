@@ -1,0 +1,96 @@
+---
+description: Automatic JA→en_US object/field label translation runs inside prep_deploy.py (Translation Workbench). Never a parallel command.
+globs: sf-deploy/scripts/{prep_deploy,translate_enrich,generate_object_translation,mcp_deepl,mcp_client,secret_resolver,fetch_sheet,write_back,validate_sheet,build_manifest,verify_deploy}.py
+alwaysApply: false
+---
+
+# Object/field label translation (inside the canonical deploy command)
+
+English labels for custom objects, the standard Name field, and custom fields
+are produced, validated, planned, deployed, and verified through the existing
+orchestrator. Provenance is also stamped on standard field rows (OwnerId,
+CreatedDate, …). There is no second translation command.
+
+```
+python scripts/prep_deploy.py --org "<ORG>" --tabs "<tab1>,<tab2>" --phase deploy \
+    --apply-translations
+```
+
+`--apply-translations` is the gated sheet write of the translation batch
+(preview first, then confirm). It is not a second pipeline.
+
+## Flow (inserted into prep_deploy, not a fork)
+
+1. Live fetch of **selected `--tabs` only**.
+2. Structural pre-validation + collect labels that need English.
+3. Provider preflight: DeepL MCP if healthy, else Google Sheets `GOOGLETRANSLATE`.
+   One provider per batch; never mix. DeepL failure after preflight is fatal
+   (no Google fallback, no partial write). DeepL resolves its key without prompts
+   from `DEEPL_API_KEY`, a locked-down `DEEPL_API_KEY_FILE`, macOS Keychain
+   (`sf-deploy/deepl`), or `DEEPL_API_KEY_COMMAND`, in that order. The key remains
+   in process memory and is passed only to the MCP child; Cursor `mcp.json` is not
+   read. Tool arguments come from `tools/list` `inputSchema` (official
+   `deepl-mcp-server` uses `sourceLangCode`/`targetLangCode` with `ja`/`en-US`).
+   Stdio supports NDJSON and LSP Content-Length.
+4. Terminology: API-name match → standard field map → unique JA→EN on the
+   selected tabs → provider.
+5. One confirmation for the complete sheet-write batch (headers, EN, provenance).
+6. Stale-check immediately before write. Recalc + read calculated Google values.
+7. Existing `validate_sheet.py` **plus** translation ERRORs (blank/invalid EN
+   never degrades to WARN).
+8. Fresh org snapshot (Tooling fields + CustomObjectTranslation).
+9. Immutable plan → schema XML + patched COT XML (org tree preserved).
+10. Manifest **from the plan**. Check-only, then real deploy, then live exact-EN verify.
+11. Sync state (org Id) only after verification succeeds.
+
+## Sheet columns (header-driven)
+
+Object header (same object tab, typically row 1 — above the field list):
+- `表示ラベル` (col A) / Japanese value (col D) = CustomObject singular+plural master
+- Object English = that **same header row** in the `Field Label (EN)` column
+- No provenance is generated for the object name (header row). Existing header
+  EN / Name EN cells are never overwritten for this.
+- If header object English is **longer than 40 characters**, the org package
+  uses the standard **Name** field English (`nameFieldLabel` row) for
+  `CustomObjectTranslation.caseValues` singular. The sheet is left as-is.
+- Plural `caseValues` (`plural=true`) is an English plural of that singular
+  (slash compounds pluralize each side, then fit ≤40). Tokens that are already
+  plural (e.g. `details`) are left unchanged. It is not copied from the
+  singular and is not written to the sheet.
+- Object **Description** (`説明`) stays Japanese on the sheet. English for the
+  org is written only to `CustomObject.description` (not Translation Workbench,
+  not the sheet). DeepL can fill that in-memory EN; **Google batches skip it**
+  because GOOGLETRANSLATE would require a sheet cell. A sheet `説明` that is a
+  layout note (record types / validation rules / lookup filters removed, add
+  later) is NOT the object description and must not be deployed. Description
+  translation does not force an otherwise translation-only existing object into
+  the schema package; it lands when that CustomObject is already in scope.
+
+Field list (from the `fullName`/`type` header down to `END[項目]`):
+- `Field Label (EN)`
+- `Translation Provenance` — one cell immediately to the right of
+  `Field Label (EN)`: `origin | ja-sha256 | generated-at`
+  (`manual` / `inventory` / `deepl` / `google`). Stamped on custom **and**
+  standard field rows. Legacy three-column headers are still read if present,
+  never created.
+
+Missing headers occupy spare `FreeColumnGDC*` cells after confirmation.
+Japanese source changes (hash mismatch) replace previous English, including
+former `manual` values. Unchanged JA is never retranslated because DeepL later
+became available.
+
+## Out of initial scope
+
+Picklist values, relationship labels, help text, LWC/Flow/Custom Labels, layouts,
+record types.
+
+## Must not
+
+- Write English into Japanese `CustomField.label`.
+- Deploy blank translations.
+- Use API name / JA source / placeholder / formula text as English.
+- Scan or modify tabs that were not selected.
+- Change `fetch_sheet.py` / `write_back.py` Google authentication.
+- Call Cloud Translation API, a service-account JSON, or an LLM to generate
+  English labels.
+- Use Cursor/Claude/another LLM to generate translations.

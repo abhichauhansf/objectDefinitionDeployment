@@ -52,6 +52,18 @@ def is_falsy(value):
     return text in {"false", "n", "no", "0", "×", "x", "✕", "✗"}
 
 
+def _org_object_description(row: dict) -> str:
+    """English org description, or Japanese — never a sheet layout note."""
+    en = str(row.get("Object Description (EN)") or "").strip()
+    if en:
+        return en
+    ja = str(row.get("Object Description") or "").strip()
+    layout_markers = ("レコードタイプ", "入力規則", "ルックアップ検索条件")
+    if sum(marker in ja for marker in layout_markers) >= 2:
+        return ""
+    return ja
+
+
 def write_object_meta(
     obj_api: str,
     obj_label: str,
@@ -716,7 +728,7 @@ def process_fields(rows: list[dict]) -> None:
         write_object_meta(
             obj_api,
             row.get("Object Label", ""),
-            row.get("Object Description", ""),
+            _org_object_description(row),
             row.get("enableReports", ""),
             row.get("enableActivities", ""),
             # force object history ON when any field tracks history (dependency)
