@@ -20,9 +20,23 @@ BLOCK or corrupt the deploy. This is the single most important gate; if Step 0
 is not clean (or explicitly accepted by the user), you do NOT proceed.
 
 Scan for blockers including (non-exhaustive):
-- Blank / missing Field API Name (`fullName`) on a custom-field row.
 - Blank required attributes for the field's type (e.g. `type`, picklist values,
   `length`/`precision`/`scale`, Lookup/Master-Detail `referenceTo`).
+  <!-- Updated by Divakar N -->
+  - **EXCEPTION — blank Field API Name (col D) is NOT a hard blocker.** A
+    custom-field row with an empty `fullName` must NOT be parked and must NOT
+    be flagged via `flag_blocker.py`. GDC owns `TI_Fnt_` names; the client
+    ships labels/types first. Generate `TI_Fnt_<Component>__c` (glossary first,
+    label-fallback if the object already exists), write it back to col D
+    (gated) plus an AH `[FIX]` note, then continue. See
+    `sf-field-api-naming.mdc` §0b. **Why:** treating blank col D as ERROR
+    parked whole new tabs (`TradeTermsAppDetail` 2026-09-21). Skip WIP /
+    IsDelete / standard rows — those are never named.
+  - **EXCEPTION — Number/Currency/Percent size is column F, not T/U.** The
+    client writes `"integerDigits, scale"` in F (e.g. `"12, 3"` → Salesforce
+    precision 15, scale 3). Blank T (`精度`) / U (`スケール`) is NOT a blocker
+    when F is valid. Blank F **and** blank T/U still is. Do not write derived
+    precision/scale back to T/U (see `sf-numeric-size-column-f.mdc`).
   - **EXCEPTION — empty FORMULA body is NOT a hard blocker.** A Formula field
     whose formula body (col H) is blank must NOT be parked: Salesforce rejects an
     empty formula, so `generate_xml.py` AUTO-INJECTS a return-type-appropriate
@@ -33,7 +47,37 @@ Scan for blockers including (non-exhaustive):
     `write_attr_fixes.py`): write the dummy back into the field's col-H value cell
     (gated) and note it in AH, so the sheet matches the org. The real formula is
     supplied later by the client.
-- Missing `relationshipName` on a Lookup / Master-Detail row.
+  <!-- Updated by Divakar N — 2026-09-23. Why: Rollup summary setup is col H
+       (設定値), not G. Blank H cannot be dummy-filled (unlike formulas) because
+       Operation/Child/Field are a business decision. Previously generate_xml
+       wrote only <type>Summary</type> and the validator looked for columns that
+       do not exist on the Format tab. -->
+  - **Rollup summary — blank H IS a hard blocker.** Column E = `Rollup summary`.
+    The setup lives in col **H** (`設定値`) as labeled `Operation:COUNT` /
+    `Child:…` / `Field:…` / `Condition:…` lines — **no space after the colon**
+    (`scripts/rollup_h.py`). Empty or Japanese-prose
+    H must be parked via `flag_blocker.py` (`summary.parse`). Never invent a dummy
+    roll-up. Never read col G.
+  <!-- Updated by Divakar N — 2026-10-05. Why: the client sometimes leaves the
+       Lookup / Master-Detail object only in col G (データ型に応じて… /
+       referenceTo) and leaves col H (設定値) blank. Parking those rows as
+       "blank H" dropped a real target. H still wins when both are filled.
+       Formula, picklist, and roll-up rows still never read G. -->
+  - **Lookup / Master-Detail — blank H falls back to col G.** The lookup
+    object (`referenceTo`) is col **H** (`設定値`). When H is blank, read col
+    **G** (`データ型に応じて…`). If G is an object API name (`User`,
+    `Foo__c`), use it and write it back to col H (gated) plus an AH `[FIX]`
+    note. If G is also blank, or is Japanese prose / not an API name, the row
+    stays a blocker — do not copy that text into H. Do not use G for Formula,
+    Picklist, or Rollup summary.
+- Missing `relationshipName` on a Lookup / Master-Detail row **only when col H
+  (`設定値` / referenceTo) and col G are both blank.** If col X is blank but
+  col H (or col G, when H is blank) has the lookup object, that is NOT a blocker:
+  - field already in the org → write back the org's `relationshipName` to col X
+    (never invent a new child-relationship name on an existing field);
+  - new field → auto-fill from the field API (minus `__c`; object-scoped for
+    shared parents like User) via `relname.derive_relationship_name`, write it
+    back to col X, and proceed.
 - API names violating `sf-field-api-naming.mdc` / `sf-field-namespace-prefix.mdc`
   (bad pattern, `> 40` chars, missing `__c`, wrong/duplicated prefix).
 - Duplicate API names within the object (case-insensitive collisions).
@@ -56,10 +100,10 @@ blocker set. Then:
    while its AH note was written):
    ```
    # single field
-   python scripts/flag_blocker.py --spreadsheet-id <ID> --tab <Tab> \
+   python scripts/flag_blocker.py --tab <Tab> \
        --object <Obj>__c --field <API>__c --check <check> --message "<why>"   # +--apply
    # many fields
-   python scripts/flag_blocker.py --spreadsheet-id <ID> --tab <Tab> \
+   python scripts/flag_blocker.py --tab <Tab> \
        --object <Obj>__c --blockers <json:[{field,check,message,severity?}]>   # +--apply
    ```
    It internally calls `write_ai_comments.py` (AH) and `highlight_blockers.py`
@@ -142,39 +186,18 @@ and deploy ONLY the new (and, if explicitly requested, changed) fields.
    ```
    It reads the org's ACTUAL metadata via the Metadata API `readMetadata`
    (FLS-independent) and compares, per field, **type, formula, referenceTo,
-   picklist values, length, visibleLines, precision, scale, required, unique, and
+   picklist values, roll-up summaryOperation/foreignKey/summarizedField/filters,
+   <!-- Updated by Divakar N — 2026-09-23: name-existence is not definition-match for roll-ups -->
+   length, visibleLines, precision, scale, required, unique, and
    externalId** (and flags any unmapped Data Type). It writes
    `.build/attr_drift_<Obj>.json`. `prep_deploy.py` runs this automatically in its
-   build phase (step 6b). SURFACE any drift to the user. Redeploying drift is a
-   user decision, not automatic — many type changes (Lookup↔Formula,
-   Checkbox↔Picklist, Text→Lookup) require delete+recreate and DESTROY the
-   field's data, so never silently redeploy a drifted field.
-3c. **TRANSLATION-LEVEL DRIFT (MANDATORY for fields present in BOTH).** The name
-   delta also does NOT prove the **English label** matches the sheet. A field
-   whose `Field Label (EN)` / `Translation Provenance` changed (Google, DeepL,
-   or a manual edit) while its API name stayed the same is invisible to
-   `sheet_custom_fields − org_existing_fields` and must still be packaged as
-   `CustomObjectTranslation` (`CHANGED_TRANSLATION`). `prep_deploy.py` prints
-   this as a separate TRANSLATIONS delta (new / changed / unchanged). Post-deploy
-   `verify_deploy.py` compares **every** in-scope sheet English value to the live
-   org — not only the rows that happened to be in this package — so a later EN
-   edit cannot be reported as "complete" while the org still has the old label.
-3d. **JAPANESE LABEL DRIFT — THE SHEET OVERWRITES THE ORG (automatic).** The
-   sheet is the master for Japanese labels. For every existing object,
-   `prep_deploy.py` compares the sheet `Object Label`, `Name Field Label` and
-   each custom `Field Label` with the org (`readMetadata`, FLS-independent) and
-   packages every difference, printed as `LABELS (JA)`. An org-side Japanese
-   edit must never silently survive a deploy. `label_sync.py` builds the relabel
-   from the org's CURRENT definition with only `<label>` replaced, so it never
-   redeploys attribute drift (§3b stays a user decision). Relabelling an object
-   also pins its local field files to the org definition, because a CustomObject
-   source deploy pushes every child field file. `verify_deploy.py --plan` fails
-   if a planned relabel did not land.
+   build phase (step 6b). SURFACE any drift to the user. Redeploying drift is a user decision, not automatic — many type changes
+   (Lookup↔Formula, Checkbox↔Picklist, Text→Lookup) require delete+recreate and
+   DESTROY the field's data, so never silently redeploy a drifted field.
 4. **Report the delta before deploying:** e.g. "org already has N fields; sheet
    defines M; deploying the D new ones; X already present (skipped); Y org-only
-   (left untouched)." **Also report translation new/changed.** Keep the schema
-   package limited to the field-name delta so redeploys stay fast; still include
-   every CHANGED/NEW English label in the translation package.
+   (left untouched)." Keep the package limited to the delta so redeploys stay
+   fast and side-effect-free.
 5. Package + validate (check-only dry-run) the delta, then deploy for real with
    `deploy.py --start` (the ONLY flag that writes).
 6. **Log every on-the-go fix in TWO places — the value cell AND the AH note.**
@@ -199,7 +222,7 @@ package; `build_destructive.py` handles the actual deletion:
 
 1. **Scan + build (safe, no writes):**
    ```
-   python scripts/build_destructive.py --spreadsheet-id <ID> \
+   python scripts/build_destructive.py \
        --tabs "<tab1>,<tab2>" --target-org "<ORG>"
    ```
    It skips WIP rows, requires a valid custom Field API Name, and with

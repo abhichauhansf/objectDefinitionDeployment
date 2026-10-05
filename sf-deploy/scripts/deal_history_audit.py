@@ -2,13 +2,13 @@
 """Audit Deal-tab revision changes (net oldest->newest) and confirm org parity."""
 import sys, os, json, base64, io, urllib.request
 sys.path.insert(0, "scripts")
+from sheet_config import DEFAULT_SPREADSHEET_ID as SID
 from googleapiclient.discovery import build
 from google.oauth2 import service_account
 from google.auth.transport.requests import Request
 import google.auth
 import openpyxl
 
-SID = "1_TaxDe-Qxl8BAUmuZc01vUoxpBEPxJ4Opx4tEe8ulNQ"
 XLSX = "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
 scopes = ["https://www.googleapis.com/auth/drive.readonly"]
 

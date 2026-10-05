@@ -13,7 +13,7 @@ Deployment is intentionally NOT part of this script. Run `scripts/deploy.py`
 separately; a real deployment requires its explicit `--start` flag.
 
 Usage:
-  python scripts/run.py --spreadsheet-id <ID> [--tabs "成約"] [--only Obj__c] [--strict]
+  python scripts/run.py [--spreadsheet-id <ID>] [--tabs "成約"] [--only Obj__c] [--strict]
 """
 from __future__ import annotations
 
@@ -21,6 +21,8 @@ import argparse
 import subprocess
 import sys
 from pathlib import Path
+
+from sheet_config import add_spreadsheet_id_arg
 
 ROOT = Path(__file__).resolve().parent.parent
 PY = sys.executable
@@ -35,7 +37,7 @@ def step(title: str, cmd: list[str]) -> int:
 
 def main() -> int:
     ap = argparse.ArgumentParser(description="Run sheet->package pipeline (no deploy)")
-    ap.add_argument("--spreadsheet-id", required=True)
+    add_spreadsheet_id_arg(ap)
     ap.add_argument("--tabs", default="", help="REQUIRED scope: object tab(s) to process (comma-separated)")
     ap.add_argument("--all-tabs", action="store_true",
                     help="explicitly process EVERY object tab (bypasses the scope gate)")

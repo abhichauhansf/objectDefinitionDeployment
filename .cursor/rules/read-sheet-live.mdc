@@ -22,9 +22,16 @@ even if they exist and look complete:
 If such a file already exists, ignore it as a data source and re-fetch. You may
 overwrite it with a fresh live pull, but the live fetch must happen first.
 
+## Default spreadsheet
+
+The project default is `DEFAULT_SPREADSHEET_ID` in
+`sf-deploy/scripts/sheet_config.py`. Use that ID unless the user pastes a
+different spreadsheet URL. To switch the default workbook, edit **only** that
+file. See `.cursor/rules/sf-default-google-sheet.mdc`.
+
 ## Required flow whenever sheet data is needed
 
-1. Identify the spreadsheet ID and the exact tab(s) required.
+1. Identify the spreadsheet ID (default: `sheet_config.py`) and the exact tab(s) required.
 2. Fetch that data live from the Google Sheet API right now (a fresh call).
 3. Use only that freshly fetched data for the analysis/lookup/proposal.
 4. If you just fetched moments ago in the same turn for the same range, you may

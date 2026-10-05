@@ -15,6 +15,7 @@ import sys
 
 sys.path.insert(0, "scripts")
 from write_back import get_write_service  # noqa: E402
+from sheet_config import add_spreadsheet_id_arg  # noqa: E402
 
 COLORS = {
     "green": {"red": 0.72, "green": 0.88, "blue": 0.72},
@@ -28,7 +29,7 @@ START_COL, END_COL = 0, 1  # column A ("No.") only — never the whole row
 
 def main() -> int:
     ap = argparse.ArgumentParser()
-    ap.add_argument("--spreadsheet-id", required=True)
+    add_spreadsheet_id_arg(ap)
     ap.add_argument("--tab", required=True)
     ap.add_argument("--rows", required=True, help="comma-separated 1-based row numbers")
     ap.add_argument("--color", default="green", choices=list(COLORS))

@@ -25,7 +25,9 @@ import sys
 
 sys.path.insert(0, "scripts")
 from fetch_sheet import find_header_row, norm  # noqa: E402
+from relname import derive_relationship_name  # noqa: E402
 from write_back import get_write_service  # noqa: E402
+from sheet_config import add_spreadsheet_id_arg  # noqa: E402
 
 
 def col_letter(i: int) -> str:
@@ -38,40 +40,13 @@ def col_letter(i: int) -> str:
     return s
 
 
-# Standard parents that accumulate child relationships from MANY objects, so a
-# bare field-derived relationshipName is collision-prone and must be scoped by
-# the owning object.
-SHARED_PARENTS = frozenset({
-    "User", "Account", "Contact", "Lead", "Group", "Case", "Opportunity",
-    "Product2", "Pricebook2", "Asset", "Campaign", "Order", "Contract",
-})
-
-
-def _obj_acronym(obj_api: str) -> str:
-    """Short token for the owning object: acronym of capitals if >=3, else a
-    trimmed component. e.g. ExportControlClassification -> 'ECC'."""
-    comp = obj_api
-    if comp.startswith("TI_Fnt_"):
-        comp = comp[len("TI_Fnt_"):]
-    if comp.endswith("__c"):
-        comp = comp[:-3]
-    caps = "".join(ch for ch in comp if ch.isupper())
-    return caps if len(caps) >= 3 else comp[:12]
-
-
 def rel_name(api: str, obj_api: str = "", parent: str = "") -> str:
-    base = api[:-3] if api.endswith("__c") else api
-    if parent in SHARED_PARENTS and obj_api:
-        # object-scope: strip our namespace from the field component, prefix acronym
-        comp = base[len("TI_Fnt_"):] if base.startswith("TI_Fnt_") else base
-        scoped = f"{_obj_acronym(obj_api)}_{comp}"
-        return scoped[:40]
-    return base
+    return derive_relationship_name(api, obj_api, parent)
 
 
 def main() -> int:
     ap = argparse.ArgumentParser()
-    ap.add_argument("--spreadsheet-id", required=True)
+    add_spreadsheet_id_arg(ap)
     ap.add_argument("--tab", required=True)
     ap.add_argument("--temp", default="temp_updates.json")
     ap.add_argument("--apply", action="store_true")

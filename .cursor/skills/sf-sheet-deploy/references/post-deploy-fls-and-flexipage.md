@@ -1,0 +1,182 @@
+# Post-Deploy FLS Prompt + Conditional FlexiPage (MANDATORY)
+
+After EVERY successful, verified deploy of an object and/or its fields (single
+object AND every object in a multi-object deploy), you MUST run BOTH gates below,
+every time. They run AFTER `verify_deploy.py` confirms the fields landed and
+AFTER the object's report tab is refreshed. Neither gate is skippable.
+
+These gates layer on top of [object-existence.md](object-existence.md),
+[deploy-delta-and-blockers.md](deploy-delta-and-blockers.md), and
+[object-tab-and-app.md](object-tab-and-app.md).
+
+`SHOOT` password text below (if any leftover) is void —
+see [deploy-authorization.md](deploy-authorization.md). Permission-set,
+FlexiPage, and CustomObject `actionOverrides` deploys proceed without a password.
+Sheet-write confirmation still applies to column-AI refresh.
+
+## GATE 0 — Refresh the per-field Deployment-Status column (AI)
+
+After verification, refresh column **AI** (`Deployment Status`, per
+[sheet-columns.md](sheet-columns.md) and
+[deploy-status-column-always.md](deploy-status-column-always.md)) on each
+deployed object's sheet tab: check every field row LIVE against the org (Tooling
+`CustomField` for custom fields — FLS-independent) and write `Deployed` /
+`Not Deployed` / `Standard` / `Deleted`. This is a gated sheet write
+([sheet-write-confirmation.md](sheet-write-confirmation.md)) — preview the diff
+and confirm before applying. Use `scripts/write_deploy_status.py`. Run it for
+every deployed object, every time. Then re-evaluate AH comments
+([ah-comment-reevaluate.md](ah-comment-reevaluate.md)).
+
+## GATE 1 — FLS: ALWAYS AUTO-GRANT (mandatory, never ask)
+
+Newly deployed custom fields have **NO field-level security** on any permission
+set or profile, so a user opening the record **cannot see them** until FLS is
+granted. Granting FLS is therefore **MANDATORY and AUTOMATIC** — do NOT ask the
+user whether to grant it or which permission set to use. Every deployed field
+gets FLS on the **default permission set `SalesFrontAdmin`**, every time.
+
+For every deploy that created/updated fields, after verification you MUST,
+WITHOUT asking:
+
+1. State plainly which fields were just deployed and that you are auto-granting
+   their FLS on `SalesFrontAdmin` (list the field count per object).
+2. **Auto-grant FLS on `SalesFrontAdmin`** (the fixed default target): retrieve
+   that permission set live, add `fieldPermissions` for each deployed custom
+   field — formula / Summary / AutoNumber fields are read-only
+   (`readable=true, editable=false`); all others `editable=true, readable=true`.
+   Required-flagged and Master-Detail fields are implicitly visible and cannot
+   carry `fieldPermissions` → skip them (that is expected, not a gap).
+3. Deploy the permission set and **verify the FLS live** afterwards.
+
+If the user has explicitly named a DIFFERENT permission set for this deploy,
+honor that instead of `SalesFrontAdmin`; otherwise always default to
+`SalesFrontAdmin` silently.
+
+You may NOT close out a field deploy as "done" without having auto-granted Gate 1
+FLS on `SalesFrontAdmin` (or the user's explicitly named alternative).
+
+### GATE 1b — FLS MUST be re-checked on ANY visibility-affecting metadata change
+
+Gate 1 is NOT limited to brand-new fields. It fires for **every deploy that
+updates existing fields**, and it MUST be re-evaluated whenever a field's
+metadata changes in a way that alters its **implicit** visibility, because such a
+change can silently make a field invisible:
+
+- **`required=true → false` (or → blank):** a required field is IMPLICITLY visible
+  and CANNOT carry `fieldPermissions`; the FLS grant correctly skips it. The moment
+  it becomes optional it LOSES that implicit visibility and has NO explicit FLS →
+  it is invisible. You MUST run Gate 1 for every field whose requiredness was
+  flipped off in this deploy (grant Read+Edit, or read-only for
+  formula/Summary/AutoNumber).
+- **Master-Detail → Lookup conversion:** the field was implicitly visible as MD;
+  as a Lookup it needs explicit FLS. Re-check.
+- Any other change that removes implicit visibility.
+
+Conversely, a field flipped `required=false → true`, or converted Lookup→MD, no
+longer needs (and cannot keep) explicit FLS — that is expected, not a gap.
+
+Practical rule: after redeploying existing fields, do NOT assume "already
+deployed ⇒ FLS already handled". Diff each object's LIVE FLS set (FLS-independent
+Tooling `CustomField` for the full field list, `FieldPermissions` for what the
+permission set already grants — NEVER `FieldDefinition`/`sobject describe`, which
+are FLS-gated and under-report). Any deployable, non-required, non-Master-Detail
+custom field that is missing from the permission set is an FLS GAP → surface it
+and run Gate 1. This is exactly how the `IncidentalExpenses` /
+`StandaloneIncidentalExpenses` / `IncidentalExpensesDetail` post-flip gap (91
+fields) and the `DealDetail` optional-field gap (23 fields) were missed — see the
+2026-08-28 KB lesson.
+
+## GATE 2 — FlexiPage: create on first object deploy only
+
+<!-- Updated by Divakar N — 2026-10-05. Why: a Lightning page created when the
+object is first added to the org must stay as deployed. Later object-definition
+sheet deploys must not regenerate or otherwise change that page. -->
+
+A Lightning Record Page (FlexiPage) is built only when **this deploy creates the
+object in the org for the first time**. Use the live existence pre-check
+([object-existence.md](object-existence.md)): MISSING before this deploy = first
+create; EXISTS before this deploy = a later update.
+
+**Object already exists (later object-definition sheet deploy).** Do not create,
+regenerate, redeploy, or otherwise modify the Lightning page. Leave the existing
+FlexiPage and its org-default `actionOverrides` exactly as they are. Sheet
+changes to Tab (Z), section (AA), or fields deployed in this update do not get
+pushed onto the page. Say so per object: Lightning page left unchanged because
+the object already existed.
+
+**Object is being created for the first time.** The CHECK is mandatory; the
+BUILD is conditional on page-layout placement info.
+
+Read LIVE from the object's sheet tab (per [read-sheet-live.md](read-sheet-live.md))
+and locate, by header name (per [sheet-columns.md](sheet-columns.md)):
+- **Tab** = column **Z** (top-level record-page tab placement), and
+- **section** = column **AA** (section within a tab).
+
+Then, for each object created in this deploy:
+
+1. **If the object has Tab and/or section info** (any non-blank Z/AA values on its
+   deployable, non-WIP field rows) → you MUST build and deploy a FlexiPage from
+   that info:
+   - section-only (AA populated, Z blank) → flat sectioned page via
+     `gen_record_page.py`.
+   - Tab + section (both Z and AA populated) → tabbed page via
+     `gen_tabbed_page.py` (top-level tabs from Z, sections from AA).
+   - Only place fields that actually EXIST in the org (filter against a live
+     field set), respect the 100-field-per-column limit (multi-column split),
+     confirm the FlexiPage API name with the user, and deploy. Then you MUST
+     set it as the object's org-default record page per **GATE 2b** below (this
+     is NOT optional and is NOT done by deploying the FlexiPage alone). Verify
+     the page live.
+2. **If the object has NO Tab/section info** (Z and AA blank across all its field
+   rows) → SKIP FlexiPage creation for that object, and say so explicitly (the
+   object keeps the system default record page). Skipping is only allowed when
+   the info is genuinely absent — never skip a first-time object that has
+   section data. A page that was not created on this first deploy is not created
+   on a later sheet deploy either.
+
+Report per object which branch was taken (built `<PageName>` on first create vs
+skipped — no Tab/section info vs left unchanged — object already existed).
+
+## GATE 2b — MANDATORY: assign the FlexiPage as the object's ORG DEFAULT
+
+Deploying a `FlexiPage` only makes it AVAILABLE — it does NOT activate it. A newly
+deployed record page is inert until it is assigned. Whenever GATE 2 built and
+deployed a FlexiPage for an object, you MUST also make it the object's **org
+default** record page in the SAME flow (never leave it on the system default, and
+never rely on a manual App-Builder "Activation" click — that is exactly how the
+`RecevingAndQuoteAndWorkRelation` page shipped unassigned).
+
+The org-default assignment is NOT stored on the FlexiPage. It is an
+`actionOverrides` block nested inside the **CustomObject** metadata (per the
+Metadata API `actionOverride` docs). Add BOTH form factors (desktop + phone) to
+`objects/<Obj>__c/<Obj>__c.object-meta.xml` using
+[action-overrides.xml](../assets/action-overrides.xml).
+
+Then deploy the `CustomObject` (object-meta only — fields are separate components
+and are NOT touched). Afterwards VERIFY live that the override landed (e.g. read
+the object's `actionOverrides` back via `readMetadata` CustomObject, or confirm
+in the org) before reporting GATE 2 complete.
+
+Skip GATE 2b when GATE 2 did not build a page in this deploy: the object already
+existed (page frozen), or the first-time create had no Tab/section info.
+
+## Guardrails
+
+- FLS and the FlexiPage check run for EVERY object in the deploy set, every
+  time — single-object and multi-object deploys alike. Do not batch-skip. The
+  FlexiPage itself is built only on first object create (GATE 2).
+- Gate 1 (AUTO-GRANT FLS on `SalesFrontAdmin`) is mandatory and automatic — never
+  ask whether to grant or which permission set. Honor a user-named alternative
+  perm set if one was explicitly given; otherwise default to `SalesFrontAdmin`
+  silently.
+- Gate 2 BUILD runs only on a first-time object create, and only when
+  Tab/section info exists. On every later object-definition sheet deploy the
+  Lightning page is frozen — do not modify it.
+- GATE 2b (org-default `actionOverrides` on the CustomObject) is MANDATORY
+  whenever this deploy built a FlexiPage — a deployed-but-unassigned page is a
+  MISS. Never defer it to a manual App-Builder click. Do not rewrite
+  `actionOverrides` on a later sheet deploy.
+- All sheet reads for Tab/section are LIVE; never evaluate them from a cached
+  snapshot.
+- FLS uses the Tooling-API / metadata view of fields (FLS-independent), never
+  `sobject describe`, to enumerate what to grant.

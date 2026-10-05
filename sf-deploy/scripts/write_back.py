@@ -26,6 +26,7 @@ sys.path.insert(0, "scripts")
 from fetch_sheet import (  # noqa: E402
     find_header_row, norm, GRAY_GUARD_SUBSTR, is_field_list_end, find_helper_cols, WIP_TRUE,
 )
+from sheet_config import add_spreadsheet_id_arg  # noqa: E402
 
 
 def get_write_service():
@@ -79,7 +80,7 @@ def live_field_rows(svc, sid: str, tab: str):
 
 def main() -> int:
     ap = argparse.ArgumentParser()
-    ap.add_argument("--spreadsheet-id", required=True)
+    add_spreadsheet_id_arg(ap)
     ap.add_argument("--tab", required=True)
     ap.add_argument("--final", default=".build/sales_deal_FINAL.json")
     ap.add_argument("--apply", action="store_true", help="actually write (else dry run)")

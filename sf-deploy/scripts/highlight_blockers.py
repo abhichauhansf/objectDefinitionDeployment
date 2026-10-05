@@ -22,6 +22,7 @@ import sys
 sys.path.insert(0, "scripts")
 from fetch_sheet import find_header_row, norm  # noqa: E402
 from write_back import get_write_service  # noqa: E402
+from sheet_config import add_spreadsheet_id_arg  # noqa: E402
 
 PINK = {"red": 0.98, "green": 0.75, "blue": 0.82}
 START_COL = 0   # column A ("No.", 0-based)
@@ -30,7 +31,7 @@ END_COL = 1     # column A only -> end-exclusive 1 (never the whole row)
 
 def main() -> int:
     ap = argparse.ArgumentParser()
-    ap.add_argument("--spreadsheet-id", required=True)
+    add_spreadsheet_id_arg(ap)
     ap.add_argument("--tab", required=True)
     ap.add_argument("--report", default=".build/validation_report.json")
     ap.add_argument("--apply", action="store_true")
