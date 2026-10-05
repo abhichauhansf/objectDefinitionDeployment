@@ -46,9 +46,10 @@ import subprocess
 import sys
 from pathlib import Path
 
+from sheet_config import add_spreadsheet_id_arg
+from relname import is_standard_object
 from secret_resolver import isolated_child_env
 
-DEFAULT_SHEET_ID = "1_TaxDe-Qxl8BAUmuZc01vUoxpBEPxJ4Opx4tEe8ulNQ"
 OBJECTS_ROOT = Path("force-app/main/default/objects")
 TRANSLATIONS_ROOT = Path("force-app/main/default/objectTranslations")
 VALIDATION_REPORT = Path(".build/validation_report.json")
@@ -123,7 +124,10 @@ def patch_object_apis(temp_path: Path) -> dict[str, str]:
     tab_of: dict[str, str] = {}
     for r in rows:
         api = str(r.get("Object API Name") or "").strip()
-        if api and not api.endswith("__c"):
+        # Updated by Divakar N — 2026-09-23. Why: do not rewrite Account →
+        # Account__c (or any other standard object). Custom fields deploy onto
+        # the existing standard entity.
+        if api and not api.endswith("__c") and not is_standard_object(api):
             api = api + "__c"
             r["Object API Name"] = api
         # a field row carries _SheetName; use it to map object -> tab
@@ -457,10 +461,10 @@ def main() -> int:
     ap.add_argument("--tabs", required=True, help="comma-separated object tab names")
     ap.add_argument("--phase", choices=["build", "deploy"], default="build")
     ap.add_argument("--test-level", default="NoTestRun")
-    ap.add_argument("--sheet-id", default=DEFAULT_SHEET_ID)
+    add_spreadsheet_id_arg(ap, dest="sheet_id", flag="--sheet-id")
     ap.add_argument("--out", default="temp_updates.json")
     ap.add_argument("--workbook", default="reports/Object_Deployment_Report.xlsx")
-    ap.add_argument("--google-home", default=os.environ.get("SEAP_GOOGLE_HOME", str(Path.home())))
+    ap.add_argument("--google-home", default=os.environ.get("SF_DEPLOY_GOOGLE_HOME", str(Path.home())))
     ap.add_argument("--sf-home", default=os.environ.get("HOME", str(Path.home())))
     ap.add_argument("--xdg-data-home", default=str(Path.home() / ".local" / "share"))
     ap.add_argument("--apply-translations", action="store_true",

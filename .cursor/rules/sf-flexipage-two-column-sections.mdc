@@ -32,9 +32,13 @@ regenerated as two-column before (re)deploy.
    `fieldSection` contains **two** `flexipage:column` blocks (e.g. grep the
    `.flexipage-meta.xml`). A multi-field section with only one column is a MISS —
    regenerate.
-5. **Applies retroactively.** Any record page previously generated as
-   single-column must be regenerated to two-column and redeployed when next
-   touched.
+5. **First create only.** Two columns apply when the page is generated on the
+   object's first deploy. A Lightning page that already exists is frozen on
+   later object-definition sheet deploys (`sf-post-deploy-fls-and-flexipage.mdc`
+   GATE 2) — do not regenerate it to fix columns.
+
+<!-- Updated by Divakar N — 2026-10-05. Why: regenerating an existing page on a
+later sheet deploy overwrites the page created at first object deploy. -->
 
 ## Implementation (keep it wired)
 

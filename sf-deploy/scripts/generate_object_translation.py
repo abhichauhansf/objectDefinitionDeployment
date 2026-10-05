@@ -25,6 +25,7 @@ from translate_enrich import (
     esc,
     invalid_english,
     english_plural_label,
+    ends_in_plural_word,
     norm,
     parse_object_translation_el,
     starts_with_for,
@@ -128,7 +129,7 @@ def render_object_file(model: dict) -> str:
         bad_pl = invalid_english(case_plural, ja="", api="")
         if bad_pl:
             raise SystemExit(f"⛔ refusing to package invalid plural English: {bad_pl}")
-        if case_plural == case_value:
+        if case_plural == case_value and not ends_in_plural_word(case_value):
             raise SystemExit(
                 f"⛔ object plural English is identical to singular ({case_value!r})"
             )

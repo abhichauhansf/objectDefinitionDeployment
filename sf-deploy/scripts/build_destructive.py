@@ -36,6 +36,7 @@ import argparse
 import json
 import subprocess
 import sys
+import tempfile
 from pathlib import Path
 
 sys.path.insert(0, "scripts")
@@ -43,6 +44,7 @@ from fetch_sheet import (  # noqa: E402
     get_sheets_service, find_header_row, find_helper_cols, build_col_map,
     norm, GRAY_GUARD_SUBSTR, is_field_list_end, WIP_TRUE, DELETE_TRUE,
 )
+from sheet_config import add_spreadsheet_id_arg  # noqa: E402
 
 API_NAME_OK = __import__("re").compile(r"^[A-Za-z][A-Za-z0-9_]*__c$")
 
@@ -119,6 +121,53 @@ def org_has_field(target_org: str, obj: str, field: str) -> bool:
         return True  # fail-open: keep it; the deploy will surface a real error
 
 
+def flexipage_refs(target_org: str, deletes: list[dict]) -> dict[str, list[str]]:
+    """Map '<Obj>__c.<Field>__c' -> [FlexiPage names placing that field].
+
+    Salesforce REFUSES to delete a field that a Lightning record page still
+    references ("The <label> custom field is used in a component on the <page>
+    Lightning page"), so a delete set containing such a field fails as a whole.
+    The field must be removed from the page (deploy the page), then deleted.
+    """
+    refs: dict[str, list[str]] = {}
+    try:
+        out = subprocess.run(
+            ["sf", "org", "list", "metadata", "--metadata-type", "FlexiPage",
+             "--target-org", target_org, "--json"],
+            capture_output=True, text=True, timeout=120)
+        pages = [p["fullName"] for p in json.loads(out.stdout or "{}").get("result", [])]
+    except Exception as e:
+        print(f"  ⚠️  FlexiPage scan skipped ({e}) — deletes may fail on page references.")
+        return refs
+    if not pages:
+        return refs
+    with tempfile.TemporaryDirectory() as td:
+        try:
+            subprocess.run(
+                ["sf", "project", "retrieve", "start", "--metadata",
+                 ",".join(f"FlexiPage:{p}" for p in pages),
+                 "--target-org", target_org, "--target-metadata-dir", td,
+                 "--unzip", "--json"],
+                capture_output=True, text=True, timeout=600)
+        except Exception as e:
+            print(f"  ⚠️  FlexiPage retrieve skipped ({e}).")
+            return refs
+        bodies = {p.name: p.read_text(encoding="utf-8", errors="replace")
+                  for p in Path(td).rglob("*.flexipage*")}
+    if not bodies:
+        print(f"  ⚠️  FlexiPage retrieve returned no page files for {len(pages)} page(s) "
+              "— cannot rule out page references; treating as BLOCKED.")
+        return {f"{d['object']}.{d['field']}": ["<unverified: retrieve empty>"]
+                for d in deletes}
+    for d in deletes:
+        key = f"{d['object']}.{d['field']}"
+        hits = [name for name, body in bodies.items()
+                if f"Record.{d['field']}" in body]
+        if hits:
+            refs[key] = hits
+    return refs
+
+
 def write_manifests(deletes: list[dict], out_dir: Path, api_version: str) -> tuple[Path, Path]:
     members = "\n".join(f"        <members>{d['object']}.{d['field']}</members>"
                         for d in deletes)
@@ -148,7 +197,7 @@ def write_manifests(deletes: list[dict], out_dir: Path, api_version: str) -> tup
 
 def main() -> int:
     ap = argparse.ArgumentParser(description="Build destructiveChanges from IsDelete (AD) flag")
-    ap.add_argument("--spreadsheet-id", required=True)
+    add_spreadsheet_id_arg(ap)
     ap.add_argument("--tabs", required=True, help="comma-separated object tab names")
     ap.add_argument("--target-org", default="", help="verify each field exists (Tooling API)")
     ap.add_argument("--out-dir", default="manifest")
@@ -179,6 +228,17 @@ def main() -> int:
     if not deletes:
         print("\nAll IsDelete fields are already absent — no destructive package needed.")
         return 0
+
+    blocked = flexipage_refs(args.target_org, deletes) if args.target_org else {}
+    if blocked:
+        print("\n" + "=" * 72)
+        print("  ⛔ BLOCKED — these fields are still placed on a Lightning record page")
+        print("     (Salesforce rejects the whole delete set until they are removed):")
+        for key, pages in blocked.items():
+            print(f"     {key}  ->  {', '.join(pages)}")
+        print("  Remove the field(s) from the page, deploy the FlexiPage, then re-run.")
+        print("=" * 72)
+        return 2
 
     dpath, ppath = write_manifests(deletes, Path(args.out_dir), args.api_version)
 

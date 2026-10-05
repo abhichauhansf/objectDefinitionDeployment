@@ -12,9 +12,23 @@ DATADICTIONARY_VALIDATION.md, GOOGLE_SHEET_STRUCTURE.md):
   - Semicolon `;` is the picklist value delimiter.
   - Checkbox: defaultValue (TRUE/FALSE) required.
   - MultiselectPicklist: visibleLines required.
-  - Lookup: relationshipName optional; MasterDetail: relationshipName required.
-  - Formula Number/Currency/Percent: precision + scale required (SF Metadata API).
+  - Lookup/MasterDetail: relationshipName (col X) is auto-filled from the field
+    API when col X is blank AND the lookup object is known. The lookup object
+    is col H (設定値). Updated by Divakar N — 2026-10-05: when H is blank, col G
+    (データ型に応じて… / referenceTo) is used instead. Only blank-X PLUS blank
+    H AND blank G is a hard blocker. A filled relationshipName longer
+    than 40 characters is a hard ERROR (Salesforce Metadata API max).
+  - Blank custom-field API name (col D) is NOT an ERROR (Divakar N, 2026-09-21):
+    emit INFO `field.api.generate` and name+write-back instead of parking.
+  - Formula Number/Currency/Percent: precision + scale required (SF Metadata API),
+    derived from col F ("12, 3") — T/U are not client-required.
+  - Number/Currency/Percent size lives in col F (サイズ); T/U are derived.
   - unique/externalId only for Text, Email, Phone, Url, Number, Currency, Percent.
+  - Rollup summary: col H (設定値) holds Operation:COUNT / Child:… / Field:…
+    / Condition:… (**no space after the colon**). Blank H is a hard blocker.
+    Updated by Divakar N — 2026-09-23: previously required non-existent
+    Summary Foreign Key / Summary Operation columns, so every roll-up failed
+    or deployed as empty ``<type>Summary</type>``.
 
 Usage:
   python scripts/validate_sheet.py [--in temp_updates.json] [--json report.json] [--strict]
@@ -27,6 +41,21 @@ import re
 import subprocess
 import sys
 from collections import defaultdict
+from pathlib import Path
+
+sys.path.insert(0, str(Path(__file__).resolve().parent))
+from relname import (  # noqa: E402
+    MAX_RELATIONSHIP_NAME,
+    TAKEN_CACHE,
+    bare_relationship_name,
+    derive_relationship_name,
+    is_standard_object,
+    qualify_relationship_name,
+    save_taken,
+)
+from rollup_h import apply_rollup_h  # noqa: E402  # Updated by Divakar N — 2026-09-23
+from numeric_size import apply_numeric_size, is_numeric_sheet_type, numeric_size_mode_banner  # noqa: E402
+from fetch_sheet import apply_lookup_ref_from_g  # noqa: E402  # Updated by Divakar N — 2026-10-05
 
 # --------------------------------------------------------------------------- #
 # Rule table  (data_type -> required / optional / forbidden / constraints)
@@ -36,19 +65,22 @@ G = "Type Specific Value"  # polymorphic Column H (picklist / referenceTo / form
 
 RULES: dict[str, dict] = {
     "Text":                {"required": ["Length"], "optional": ["Unique", "External ID"], "forbidden": ["Precision", "Scale", "Visible Lines", "Mask Character"], "len": ("Length", 1, 255)},
-    "TextArea":            {"required": ["Length"], "optional": [], "forbidden": ["Precision", "Scale", "Visible Lines", "Mask Character", "Unique", "External ID"], "len": ("Length", 1, 255)},
+    "TextArea":            {"required": [], "optional": ["Length"], "forbidden": ["Precision", "Scale", "Visible Lines", "Mask Character", "Unique", "External ID"]},
     "LongTextArea":        {"required": ["Length", "Visible Lines"], "optional": [], "forbidden": ["Precision", "Scale", "Mask Character", "Unique", "External ID"], "len": ("Length", 256, 131072), "vl": ("Visible Lines", 1, 50)},
     "Html":                {"required": ["Length", "Visible Lines"], "optional": [], "forbidden": ["Precision", "Scale", "Mask Character", "Unique", "External ID"], "len": ("Length", 256, 131072), "vl": ("Visible Lines", 1, 50)},
     "EncryptedText":       {"required": ["Length", "Mask Character"], "optional": [], "forbidden": ["Precision", "Scale", "Visible Lines"], "len": ("Length", 1, 175)},
-    "Number":              {"required": ["Precision", "Scale"], "optional": ["Unique", "External ID"], "forbidden": ["Length", "Visible Lines", "Mask Character"], "num": True},
-    "Currency":            {"required": ["Precision", "Scale"], "optional": ["Unique", "External ID"], "forbidden": ["Length", "Visible Lines", "Mask Character"], "num": True},
-    "Percent":             {"required": ["Precision", "Scale"], "optional": ["Unique", "External ID"], "forbidden": ["Length", "Visible Lines", "Mask Character"], "num": True},
+    # Length (col F) is the client-facing numeric size ("12, 3"); Precision/Scale
+    # are derived in-memory. Keep them required AFTER apply_numeric_size so a
+    # blank F AND blank T/U still fails. Do NOT forbid Length.
+    "Number":              {"required": ["Precision", "Scale"], "optional": ["Unique", "External ID"], "forbidden": ["Visible Lines", "Mask Character"], "num": True},
+    "Currency":            {"required": ["Precision", "Scale"], "optional": ["Unique", "External ID"], "forbidden": ["Visible Lines", "Mask Character"], "num": True},
+    "Percent":             {"required": ["Precision", "Scale"], "optional": ["Unique", "External ID"], "forbidden": ["Visible Lines", "Mask Character"], "num": True},
     "Picklist":            {"required": [G], "optional": ["Global Value Set", "Restricted"], "forbidden": ["Length", "Precision", "Scale", "Visible Lines", "Mask Character", "Unique", "External ID"], "picklist": True},
     "MultiselectPicklist": {"required": [G, "Visible Lines"], "optional": ["Global Value Set", "Restricted"], "forbidden": ["Length", "Precision", "Scale", "Mask Character", "Unique", "External ID"], "picklist": True, "vl": ("Visible Lines", 1, 50)},
     "Lookup":              {"required": [G], "optional": ["Relationship Label", "Relationship Name", "Delete Constraint"], "forbidden": ["Length", "Precision", "Scale", "Visible Lines", "Mask Character"], "ref": True},
-    "MasterDetail":        {"required": [G, "Relationship Name"], "optional": ["Relationship Label"], "forbidden": ["Length", "Precision", "Scale", "Visible Lines", "Mask Character"], "ref": True},
+    "MasterDetail":        {"required": [G], "optional": ["Relationship Label", "Relationship Name"], "forbidden": ["Length", "Precision", "Scale", "Visible Lines", "Mask Character"], "ref": True},
     "AutoNumber":          {"required": [G], "optional": [], "forbidden": ["Length", "Precision", "Scale", "Visible Lines", "Mask Character", "Unique"]},
-    "Summary":             {"required": ["Summary Foreign Key", "Summary Operation"], "optional": ["Summarized Field"], "forbidden": ["Length", "Precision", "Scale", "Visible Lines", "Mask Character", "Unique", "External ID"], "summary": True},
+    "Summary":             {"required": [G], "optional": [], "forbidden": ["Length", "Precision", "Scale", "Visible Lines", "Mask Character", "Unique", "External ID"], "summary": True},  # Updated by Divakar N — 2026-09-23: required is col H, not phantom Summary columns
     "Checkbox":            {"required": [], "optional": ["Default Value"], "forbidden": ["Length", "Precision", "Scale", "Visible Lines", "Mask Character", G, "Unique", "External ID"], "checkbox": True},
     "Date":                {"required": [], "optional": [], "forbidden": ["Length", "Precision", "Scale", "Visible Lines", "Mask Character", G, "Unique", "External ID"]},
     "DateTime":            {"required": [], "optional": [], "forbidden": ["Length", "Precision", "Scale", "Visible Lines", "Mask Character", G, "Unique", "External ID"]},
@@ -71,6 +103,12 @@ FORMULA_NUMERIC = {"Formula Number", "Formula Currency", "Formula Percent"}
 
 UNIQUE_EXTID_TYPES = {"Text", "Email", "Phone", "Url", "Number", "Currency", "Percent"}
 API_NAME_RE = re.compile(r"^[A-Za-z][A-Za-z0-9_]*$")
+KNOWN_STANDARD = {
+    "Id", "Name", "OwnerId", "CreatedById", "CreatedDate", "LastModifiedById",
+    "LastModifiedDate", "SystemModstamp", "IsDeleted", "LastActivityDate",
+    "LastViewedDate", "LastReferencedDate", "RecordTypeId", "RecordType",
+    "CurrencyIsoCode",
+}
 TRUTHY = {"true", "y", "yes", "1", "○", "〇"}
 BOOLEANISH = TRUTHY | {"false", "n", "no", "0", "×", "-", ""}
 
@@ -147,12 +185,22 @@ def normalize_type(raw: str):
     t = str(raw or "").strip()
     if t in FORMULA_TYPES:
         return t, True
-    # normalize a few aliases (Boolean is the sheet's spelling for Checkbox)
-    aliases = {"Formula DateTime": "Formula Date/Time", "Boolean": "Checkbox"}
-    return aliases.get(t, t), False
+    # normalize a few aliases: Boolean is the sheet's spelling for Checkbox, and
+    # Text Area / Rich Text Area / Rollup summary are the type-dropdown spellings
+    # of TextArea / Html / Summary. Keyed like generate_xml._key (no spaces/case).
+    aliases = {"formuladatetime": "Formula Date/Time", "boolean": "Checkbox",
+               "textarea": "TextArea", "richtextarea": "Html",
+               "rollupsummary": "Summary", "roll-upsummary": "Summary",  # Updated by Divakar N — 2026-09-23
+               "autonumber": "AutoNumber"}
+    return aliases.get(t.lower().replace(" ", ""), t), False
 
 
-def validate(rows: list[dict], rep: Report, org_objects: set[str] | None = None) -> None:
+def validate(
+    rows: list[dict],
+    rep: Report,
+    org_objects: set[str] | None = None,
+    org_child_rels: dict[str, list[dict]] | None = None,
+) -> None:
     # object set present in this deploy (for dependency hints)
     deploy_objects = {r.get("Object API Name", "").strip()
                       for r in rows if r.get("_type") == "object_meta"}
@@ -172,6 +220,11 @@ def validate(rows: list[dict], rep: Report, org_objects: set[str] | None = None)
             obj = r.get("Object API Name", "").strip()
             if not obj:
                 rep.error(r.get("Object Label", "?"), "-", "object.api", "Object API Name is blank")
+            elif is_standard_object(obj):
+                # Updated by Divakar N — 2026-09-23. Why: custom fields (incl.
+                # Rollup summary) can land on standard objects such as Account.
+                # Requiring __c here parked the Account roll-up test as ERROR.
+                pass
             elif not (API_NAME_RE.match(obj) and obj.endswith("__c")):
                 rep.error(obj, "-", "object.api", f"Object API '{obj}' invalid (must match API name regex and end __c)")
             obj_en = r.get("Object Label (EN)", "")
@@ -192,16 +245,36 @@ def validate(rows: list[dict], rep: Report, org_objects: set[str] | None = None)
         raw_type = r.get("Data Type", "").strip()
         loc = fapi or label or "(row)"
 
+        # Standard fields are never packaged. Identify them before schema
+        # checks so a blank Data Type on RecordType / OwnerId / etc. is not
+        # a blocker (the DD sheet often leaves type empty on system rows).
+        is_standard = bool(fapi) and (
+            fapi in KNOWN_STANDARD or not fapi.endswith("__c")
+        )
+
         # ---- schema: required trio -------------------------------------- #
         if not label:
             rep.error(obj, loc, "field.label", "Field Label (label) is missing")
-        if not raw_type:
+        if not raw_type and not is_standard:
             rep.error(obj, loc, "field.type", "Data Type (type) is missing")
         if not fapi:
-            rep.error(obj, loc, "field.api", f"Field API Name (fullName) is missing for '{label}'")
+            # Updated by Divakar N — 2026-09-21. Blank API is NOT a blocker.
+            # Why: the client ships labels/types first; GDC generates TI_Fnt_
+            # names and writes them back to col D. ERROR here parked whole new
+            # tabs (TradeTermsAppDetail). Remaining type checks still run.
+            rep.info(obj, loc, "field.api.generate",
+                     f"Field API Name (fullName) is blank for '{label}' — not a "
+                     f"blocker; generate TI_Fnt_<Component>__c and write back to col D")
         else:
             if not fapi.endswith("__c"):
-                rep.warn(obj, loc, "field.api", f"'{fapi}' has no __c suffix — treated as standard field, not deployed")
+                if fapi in KNOWN_STANDARD:
+                    # Known Salesforce-owned names — not an error. INFO so the
+                    # log stays honest without looking like an API-name problem.
+                    rep.info(obj, loc, "field.api",
+                             f"'{fapi}' is a standard field — not tool-deployed")
+                else:
+                    rep.warn(obj, loc, "field.api",
+                             f"'{fapi}' has no __c suffix — treated as standard field, not deployed")
             core = fapi[:-3] if fapi.endswith("__c") else fapi
             if not API_NAME_RE.match(core) or "__" in core:
                 rep.error(obj, loc, "field.api", f"'{fapi}' is not a valid Salesforce API name")
@@ -217,8 +290,7 @@ def validate(rows: list[dict], rep: Report, org_objects: set[str] | None = None)
 
         # Standard fields (no __c) are never deployed by generate_xml, so their
         # field-definition columns (Length, referenceTo, Precision, etc.) are
-        # irrelevant. Emit only the standard-field WARN above and skip the rest
-        # to avoid spurious required.column / constraint / forbidden errors on
+        # irrelevant. Skip the rest to avoid spurious required.column errors on
         # sheet-provided system rows (OwnerId, CreatedDate, LastModifiedDate…).
         if fapi and not fapi.endswith("__c"):
             continue
@@ -227,6 +299,28 @@ def validate(rows: list[dict], rep: Report, org_objects: set[str] | None = None)
             continue
 
         sf_type, is_formula = normalize_type(raw_type)
+
+        # Updated by Divakar N — 2026-10-05.
+        # Lookup / Master-Detail: col H is the lookup object. When H is blank,
+        # use col G. Formula / picklist / roll-up never take this path.
+        apply_lookup_ref_from_g(r)
+        ref_col = "col G" if r.get("_referenceToSource") == "G" else "col H"
+
+        # ---- blank col X: auto-fill from the lookup object --------------- #
+        # If relationshipName is blank but H (or G, when H is blank) has a
+        # valid referenceTo, derive X from the field API (object-scoped for
+        # shared parents). This is NOT a blocker. Blank X + blank H + blank G
+        # remains an ERROR (caught in the ref block below).
+        if sf_type in ("Lookup", "MasterDetail", "Hierarchy") and not nonblank(r.get("Relationship Name")):
+            href = str(r.get(G) or r.get("Reference To") or "").strip()
+            if href and fapi.endswith("__c"):
+                derived = derive_relationship_name(fapi, obj, href)
+                if derived:
+                    r["Relationship Name"] = derived
+                    r["_relname_autofilled"] = derived
+                    rep.info(obj, loc, "relationshipname.autofill",
+                             f"col X blank; {ref_col} has lookup object '{href}' → "
+                             f"auto-filled relationshipName='{derived}' (write back to sheet)")
 
         # ---- unknown type ----------------------------------------------- #
         if is_formula:
@@ -239,6 +333,17 @@ def validate(rows: list[dict], rep: Report, org_objects: set[str] | None = None)
             rep.error(obj, loc, "field.type", f"Unknown/unsupported Data Type '{raw_type}'")
             continue
 
+        # Number/Currency/Percent (+ formula): derive Precision/Scale from col F
+        # ("12, 3" → precision 15, scale 3). T/U are not client-required.
+        # Updated by Divakar N.
+        num_size_failed = False
+        if is_numeric_sheet_type(raw_type) or (
+                is_formula and sf_type in ("Number", "Currency", "Percent")):
+            st = apply_numeric_size(r)
+            if st.get("ok") is False:
+                rep.error(obj, loc, "numeric.size", st["error"])
+                num_size_failed = True
+
         # ---- required columns ------------------------------------------- #
         for col in rule.get("required", []):
             if not nonblank(r.get(col)):
@@ -249,13 +354,38 @@ def validate(rows: list[dict], rep: Report, org_objects: set[str] | None = None)
                              f"{raw_type}: formula body (Column H) is empty — generator "
                              f"injects a dummy; real formula supplied later")
                     continue
+                # Updated by Divakar N — 2026-09-23.
+                # Why: unlike empty formulas, a blank roll-up H cannot be dummy-filled
+                # (operation/child/field are a business decision). Hard blocker.
+                if sf_type == "Summary" and col == G:
+                    rep.error(obj, loc, "summary.parse",
+                              "Rollup summary col H (設定値) is empty — fill "
+                              "Operation:COUNT / Child:… (no space after colon; never col G)")
+                    continue
                 # LongTextArea/Html visibleLines blank — generator defaults to 3.
                 if col == "Visible Lines" and sf_type in ("LongTextArea", "Html"):
                     rep.warn(obj, loc, "visiblelines.default",
                              f"{raw_type}: 'Visible Lines' empty — generator defaults to 3")
                     continue
+                # Precision/Scale empty after apply_numeric_size already reported.
+                if num_size_failed and col in ("Precision", "Scale"):
+                    continue
                 rep.error(obj, loc, "required.column",
                           f"{raw_type}: required column '{col}' is empty")
+
+        # ---- formula body hygiene --------------------------------------- #
+        if is_formula:
+            fbody = str(r.get(G) or "").strip()
+            if "__c__r" in fbody:
+                rep.error(obj, loc, "formula.rel",
+                          "formula uses '__c__r' — relationship is FieldApi__r "
+                          "(no extra __c before __r)")
+            ph = fbody.strip().strip('"').strip("'")
+            ret = raw_type[7:].strip() if raw_type.lower().startswith("formula") else sf_type
+            if ph in {"TDB", "TBD"} and ret.lower() not in {"text", ""}:
+                rep.warn(obj, loc, "formula.placeholder",
+                         f"{raw_type} body {fbody!r} is not valid for return type "
+                         f"{ret}; generator injects a type dummy")
 
         # ---- forbidden columns ------------------------------------------ #
         for col in rule.get("forbidden", []):
@@ -264,7 +394,7 @@ def validate(rows: list[dict], rep: Report, org_objects: set[str] | None = None)
                          f"{raw_type}: column '{col}'='{r.get(col)}' should be blank for this type")
 
         # ---- numeric constraints ---------------------------------------- #
-        if rule.get("num") or raw_type in FORMULA_NUMERIC:
+        if (rule.get("num") or raw_type in FORMULA_NUMERIC) and not num_size_failed:
             _check_int(rep, obj, loc, "Precision", r.get("Precision"), 1, 18)
             _check_int(rep, obj, loc, "Scale", r.get("Scale"), 0, 17)
             p, s = _to_int(r.get("Precision")), _to_int(r.get("Scale"))
@@ -277,6 +407,11 @@ def validate(rows: list[dict], rep: Report, org_objects: set[str] | None = None)
             col, lo, hi = rule["vl"]
             if nonblank(r.get(col)):
                 _check_int(rep, obj, loc, col, r.get(col), lo, hi)
+
+        # Salesforce TextArea is always 255 chars; Metadata API rejects <length>.
+        if sf_type == "TextArea" and nonblank(r.get("Length")):
+            rep.info(obj, loc, "textarea.length",
+                     "TextArea length is fixed at 255 by Salesforce; generator omits <length>")
 
         # ---- unique / externalId gate ----------------------------------- #
         for col in ("Unique", "External ID"):
@@ -341,6 +476,7 @@ def validate(rows: list[dict], rep: Report, org_objects: set[str] | None = None)
                 if not entries:
                     rep.error(obj, loc, "picklist.values", "Picklist has no usable values")
                 seen_api: set[str] = set()
+                seen_label: set[str] = set()
                 for e in entries:
                     # count colons that are NOT escaped as "\:"
                     unescaped = e.replace("\\:", "")
@@ -365,17 +501,41 @@ def validate(rows: list[dict], rep: Report, org_objects: set[str] | None = None)
                         rep.error(obj, loc, "picklist.dup",
                                   f"Duplicate picklist ApiName '{api}'")
                     seen_api.add(key)
+                    # Salesforce also rejects duplicate value LABELS ("Duplicate label: …").
+                    lkey = label.strip().lower()
+                    if lkey in seen_label:
+                        rep.error(obj, loc, "picklist.dup_label",
+                                  f"Duplicate picklist label '{label}' (ApiName '{api}') — "
+                                  "Salesforce requires unique value labels")
+                    seen_label.add(lkey)
 
         # ---- dependency: reference target ------------------------------- #
         if rule.get("ref"):
             # Count this relationship toward the object's 40-relationship budget.
             rel_count[obj] += 1
             ref = str(r.get(G) or r.get("Reference To") or "").strip()
+            if r.get("_referenceToSource") == "G" and ref:
+                # Updated by Divakar N — 2026-10-05. Value came from col G;
+                # write it back to col H so the sheet matches the deploy.
+                rep.info(obj, loc, "referenceTo.readG",
+                         f"{raw_type}: col H blank; lookup object taken from col G "
+                         f"'{ref}' — write it back to col H (設定値)")
             if not ref:
-                rep.error(obj, loc, "dependency.ref", f"{raw_type}: referenceTo (Column H) is empty")
+                rejected = str(r.get("_referenceToGRejected") or "").strip()
+                if rejected:
+                    # Updated by Divakar N — 2026-10-05. G was checked; not an API.
+                    rep.error(obj, loc, "dependency.ref",
+                              f"{raw_type}: referenceTo col H (設定値) is blank; "
+                              f"col G '{rejected}' is not an object API name")
+                else:
+                    rep.error(obj, loc, "dependency.ref",
+                              f"{raw_type}: referenceTo is empty in col H (設定値) and "
+                              f"col G (データ型に応じて…)")
             elif not API_NAME_RE.match(ref):
+                src = " (from col G; col H was blank)" if r.get("_referenceToSource") == "G" else ""
                 rep.error(obj, loc, "dependency.ref",
-                          f"{raw_type}: referenceTo '{ref}' is not a valid API name (placeholder like 要確認?)")
+                          f"{raw_type}: referenceTo '{ref}' is not a valid API name{src} "
+                          f"(placeholder like 要確認?)")
             elif ref.endswith("__c") and ref not in deploy_objects:
                 # Live org-existence check when --target-org was supplied. SF API
                 # names are case-insensitive, so compare lowercased. A referenceTo
@@ -393,14 +553,74 @@ def validate(rows: list[dict], rep: Report, org_objects: set[str] | None = None)
                 else:
                     rep.info(obj, loc, "dependency.ref",
                              f"referenceTo '{ref}' is a custom object not in this deploy set — ensure it exists in the target org")
-            # relationshipName: MasterDetail already requires it via RULES; a blank
-            # Lookup relationshipName reaches the org blank (generate_xml omits it)
-            # and Salesforce REJECTS it — flag it here (see KB 2026-08-20).
-            if sf_type == "Lookup" and not nonblank(r.get("Relationship Name")):
-                rep.error(obj, loc, "dependency.relationshipname",
-                          "Lookup: Relationship Name is blank — Salesforce requires "
-                          "it on every relationship; fill it (or run fill_relationship_name.py) "
-                          "before deploy")
+            # relationshipName: auto-filled above when H or G has the lookup
+            # object. Only flag when X, H, and G are all blank (cannot derive).
+            # Updated by Divakar N — 2026-10-05.
+            if sf_type in ("Lookup", "MasterDetail") and not nonblank(r.get("Relationship Name")):
+                if not ref:
+                    rejected = str(r.get("_referenceToGRejected") or "").strip()
+                    if rejected:
+                        why = (f"col H is blank and col G '{rejected}' is not an "
+                               f"object API name")
+                    else:
+                        why = "col H and col G have no lookup object"
+                    rep.error(obj, loc, "dependency.relationshipname",
+                              f"{sf_type}: Relationship Name (col X) is blank AND "
+                              f"{why} — cannot auto-fill")
+                elif not fapi.endswith("__c"):
+                    # Updated by Divakar N — API still blank: not a blocker.
+                    # relationshipName is filled after the API name is generated.
+                    pass
+                else:
+                    rep.error(obj, loc, "dependency.relationshipname",
+                              f"{sf_type}: Relationship Name is blank and could "
+                              f"not be derived from {ref_col} '{ref}'")
+            reln = str(r.get("Relationship Name") or "").strip()
+            if (
+                reln
+                and fapi.startswith("TI_Fnt_")
+                and obj.startswith("TI_Logi_")
+            ):
+                qualified = qualify_relationship_name(reln, obj)
+                if qualified != reln:
+                    r["Relationship Name"] = qualified
+                    r["_relname_qualified"] = qualified
+                    rep.info(
+                        obj, loc, "relationshipname.qualify",
+                        f"relationshipName '{reln}' collides with the TI_Fnt_ twin "
+                        f"on parent '{ref}' → '{qualified}' (write back to col X)",
+                    )
+                    reln = qualified
+            if reln and len(reln) > MAX_RELATIONSHIP_NAME:
+                rep.error(obj, loc, "relationshipname.length",
+                          f"{sf_type}: Relationship Name '{reln}' is {len(reln)} "
+                          f"chars (Salesforce max {MAX_RELATIONSHIP_NAME})")
+            # Live: child relationship names are unique on the PARENT. A name
+            # already used by another object (e.g. TI_Fnt_TINETAccount vs
+            # TI_Logi_TINETAccount) fails deploy.
+            if reln and org_child_rels and ref:
+                for cr in org_child_rels.get(ref.lower(), []):
+                    if cr.get("relationshipName", "").lower() != reln.lower():
+                        continue
+                    child_obj = (cr.get("childSObject") or "").strip()
+                    child_field = (cr.get("field") or "").strip()
+                    same_field = (
+                        child_obj == obj and child_field == fapi
+                    )
+                    if same_field:
+                        continue
+                    suggested = qualify_relationship_name(reln, obj)
+                    extra = (
+                        f" — use '{suggested}'"
+                        if suggested and suggested != reln
+                        else ""
+                    )
+                    rep.error(
+                        obj, loc, "relationshipname.collision",
+                        f"child relationship '{reln}' already exists on {ref} "
+                        f"(from {child_obj}.{child_field}){extra}",
+                    )
+                    break
 
         # ---- deleteConstraint (Lookup only) ----------------------------- #
         dc_raw = str(r.get("Delete Constraint") or "").strip()
@@ -424,13 +644,34 @@ def validate(rows: list[dict], rep: Report, org_objects: set[str] | None = None)
                     rep.info(obj, loc, "deleteconstraint.required",
                              "SetNull lookup cannot be required — generator drops 'required'")
 
-        # ---- summary dependency ----------------------------------------- #
+        # ---- summary (col H Operation:COUNT / Child:…; no space after colon) ---- #
+        # Updated by Divakar N — 2026-09-23.
+        # Why: parse H so SUM without Field / bad operators / prose-in-H fail
+        # at STEP 0 instead of deploying a type-only Summary field.
         if rule.get("summary"):
-            op = str(r.get("Summary Operation") or "").strip().upper()
-            if op and op not in {"SUM", "MIN", "MAX", "COUNT"}:
-                rep.error(obj, loc, "summary.op", f"Summary Operation '{op}' invalid (SUM/MIN/MAX/COUNT)")
-            if op in {"SUM", "MIN", "MAX"} and not nonblank(r.get("Summarized Field")):
-                rep.error(obj, loc, "summary.field", f"Summarized Field required when operation is {op}")
+            parsed = apply_rollup_h(r) or r.get("_rollup") or {}
+            hval = str(r.get(G) or "").strip()
+            if not hval:
+                # Blank H already reported as summary.parse in required-column.
+                pass
+            else:
+                for err in parsed.get("errors") or []:
+                    if "empty" in err and not hval:
+                        continue
+                    check = "summary.parse"
+                    if err.startswith("missing Operation") or "Operation '" in err:
+                        check = "summary.op"
+                    elif err.startswith("missing Child") or "Child must" in err:
+                        check = "summary.child"
+                    elif "Field:" in err or "Field must" in err:
+                        check = "summary.field"
+                    elif "Condition" in err or "filter field" in err or "valueField" in err:
+                        check = "summary.filter"
+                    elif "max" in err.lower():
+                        check = "summary.filter.limit"
+                    rep.error(obj, loc, check, err)
+                for warn in parsed.get("warnings") or []:
+                    rep.warn(obj, loc, "summary.field", warn)
 
     # ---- per-object 40 custom-relationship limit (post-scan) ------------- #
     # Salesforce hard cap: an object may have at most 40 custom relationships
@@ -501,6 +742,44 @@ def query_org_objects(target_org: str, ref_names: set[str]) -> set[str]:
     return present
 
 
+def query_parent_child_relationships(
+    target_org: str, parents: set[str]
+) -> dict[str, list[dict]]:
+    """childRelationships on each lookup parent (sobject describe).
+
+    Used to catch relationshipName collisions that are unique on the PARENT,
+    not on the child object (TI_Fnt_TINETAccount vs TI_Logi_TINETAccount).
+    """
+    out: dict[str, list[dict]] = {}
+    for parent in sorted(p for p in parents if p):
+        try:
+            cp = subprocess.run(
+                [
+                    "sf", "sobject", "describe",
+                    "--sobject", parent,
+                    "--target-org", target_org,
+                    "--json",
+                ],
+                capture_output=True, text=True, timeout=120,
+            )
+            data = json.loads(cp.stdout or "{}")
+            result = data.get("result") or data
+            rels = []
+            for cr in result.get("childRelationships") or []:
+                rn = bare_relationship_name(str(cr.get("relationshipName") or ""))
+                if not rn:
+                    continue
+                rels.append({
+                    "relationshipName": rn,
+                    "childSObject": str(cr.get("childSObject") or "").strip(),
+                    "field": str(cr.get("field") or "").strip(),
+                })
+            out[parent.lower()] = rels
+        except Exception as e:
+            print(f"⚠️  child-relationship describe failed for {parent} ({e})")
+    return out
+
+
 def _to_int(v):
     try:
         return int(str(v).strip())
@@ -548,6 +827,8 @@ def main() -> int:
                          "'…Master__c?' hint). Offline when omitted.")
     args = ap.parse_args()
 
+    numeric_size_mode_banner()
+
     try:
         rows = json.load(open(args.inp, encoding="utf-8"))
     except FileNotFoundError:
@@ -555,15 +836,22 @@ def main() -> int:
         return 1
 
     org_objects = None
+    org_child_rels = None
     if args.target_org:
         refs = collect_reference_targets(rows)
         if refs:
             print(f"🔎 checking {len(refs)} distinct referenceTo target(s) live "
                   f"against org '{args.target_org}'…")
             org_objects = query_org_objects(args.target_org, refs)
+            print(f"🔎 checking child relationship names on {len(refs)} "
+                  f"parent object(s)…")
+            org_child_rels = query_parent_child_relationships(args.target_org, refs)
+            save_taken(args.target_org, org_child_rels)
+    else:
+        TAKEN_CACHE.unlink(missing_ok=True)
 
     rep = Report()
-    validate(rows, rep, org_objects=org_objects)
+    validate(rows, rep, org_objects=org_objects, org_child_rels=org_child_rels)
     print_log(rep, len(rows))
 
     if args.json_out:

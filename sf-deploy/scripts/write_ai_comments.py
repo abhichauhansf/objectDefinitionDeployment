@@ -35,6 +35,7 @@ import sys
 
 sys.path.insert(0, "scripts")
 from fetch_sheet import find_header_row, norm, GRAY_GUARD_SUBSTR, is_field_list_end  # noqa: E402
+from sheet_config import add_spreadsheet_id_arg  # noqa: E402
 
 # Client renamed AH header FreeColumnGDC1 -> "GDC AI Tool Comments"; match the new
 # name first, keep the old one for backwards compatibility.
@@ -145,7 +146,7 @@ def build_comment_map(rows: list[dict], report: dict | None,
 
 def main() -> int:
     ap = argparse.ArgumentParser(description="Write AI review comments into AH (FreeColumnGDC1)")
-    ap.add_argument("--spreadsheet-id", required=True)
+    add_spreadsheet_id_arg(ap)
     ap.add_argument("--tab", required=True)
     ap.add_argument("--report", default="", help="validate_sheet.py --json output")
     ap.add_argument("--object", default="", help="only use report items for this object API (e.g. TI_Fnt_Shipping__c)")

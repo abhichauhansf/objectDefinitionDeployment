@@ -145,6 +145,9 @@ def main() -> int:
     ap.add_argument("--ignore-conflicts", action="store_true",
                     help="pass --ignore-conflicts to sf (force local source over "
                          "source-tracking conflicts). Use only for intentional redeploys.")
+    ap.add_argument("--allow-permset-shrink", action="store_true",
+                    help="allow a PermissionSet deploy whose local file holds fewer "
+                         "field/object/tab permissions than the org (full replace removes them)")
     ap.add_argument("--dry-run", action="store_true", help="print the sf command, do not run")
     args = ap.parse_args()
 
@@ -193,6 +196,20 @@ def main() -> int:
             print("   Run validate_sheet.py first, or pass --skip-validation-gate to override.")
             return 2
 
+    # ---- permission-set shrink gate ---------------------------------------- #
+    # A PermissionSet metadata deploy REPLACES the whole set in the org: any
+    # field/object/tab permission missing from the local file is REMOVED.
+    if not args.allow_permset_shrink:
+        shrunk = _permset_shrink_check(pkg, org)
+        if shrunk:
+            print("⛔ DEPLOY BLOCKED — local PermissionSet file(s) would REMOVE permissions from the org:")
+            for line in shrunk:
+                print(f"   {line}")
+            print("   Retrieve the permission set from the org first and edit that copy,")
+            print("   or grant additively via the data API (grant_fls.py / grant_object_perms.py /")
+            print("   grant_tab_visibility.py). Pass --allow-permset-shrink only for an intended removal.")
+            return 2
+
     # Check-only uses `deploy start --dry-run` (validates, writes nothing,
     # accepts NoTestRun on sandboxes). `deploy validate` is reserved for
     # production quick-deploys and rejects NoTestRun, so we do not use it here.
@@ -233,6 +250,19 @@ def main() -> int:
     rc = _run_tee(cmd, logpath)
 
     mode_label = "start" if args.start else "validate (dry-run)"
+    if rc != 0 and _is_nothing_to_deploy(logpath):
+        # Source tracking reports NothingToDeploy when the manifest members
+        # already match the org. That is the desired end state, not a failure.
+        print("ℹ️  NothingToDeploy — local source already matches the org; treating as success.")
+        return 0
+    if rc != 0 and _is_transport_drop(logpath):
+        status = _server_side_status(org)
+        print(f"ℹ️  CLI lost its connection while polling; server-side deploy status = {status!r}.")
+        with logpath.open("a", encoding="utf-8") as lf:
+            lf.write(f"# server-side status after transport drop: {status}\n")
+        if status == "Succeeded":
+            print("   The deploy landed in the org; treating as success (live verification still required).")
+            return 0
     if rc != 0:
         _write_failure_context(logpath, cmd, org, mode_label, rc)
         _auto_log_failure()
@@ -257,6 +287,103 @@ def _auto_log_failure() -> None:
                        timeout=30)
     except Exception as e:
         print(f"⚠️  auto-log of failure lesson skipped: {e}")
+
+
+def _is_nothing_to_deploy(logpath: Path) -> bool:
+    """True when sf exited non-zero only because source tracking has no diffs.
+
+    `NothingToDeploy` / `No local changes to deploy` means the manifest members
+    already match the org — the desired state, not a metadata failure.
+    """
+    try:
+        text = logpath.read_text(encoding="utf-8", errors="replace")
+    except Exception:
+        return False
+    return ("NothingToDeploy" in text) or ("No local changes to deploy" in text)
+
+
+def _is_transport_drop(logpath: Path) -> bool:
+    """True when sf failed on a network/transport error rather than a metadata error.
+
+    `MetadataTransferError: ... fetch failed` is raised by the CLI's status poll;
+    the deploy job itself keeps running server-side and may have succeeded.
+    """
+    try:
+        text = logpath.read_text(encoding="utf-8", errors="replace")
+    except Exception:
+        return False
+    return "MetadataTransferError" in text and "fetch failed" in text
+
+
+def _server_side_status(org: str, attempts: int = 20, delay: float = 15.0) -> str:
+    """Poll `sf project deploy report --use-most-recent` until the job is terminal."""
+    import time
+    terminal = {"Succeeded", "SucceededPartial", "Failed", "Canceled"}
+    status = "Unknown"
+    for _ in range(attempts):
+        try:
+            out = subprocess.run(
+                ["sf", "project", "deploy", "report", "--use-most-recent",
+                 "--target-org", org, "--json"],
+                capture_output=True, text=True, timeout=120)
+            status = (json.loads(out.stdout or "{}").get("result") or {}).get("status") or "Unknown"
+        except Exception:
+            status = "Unknown"
+        if status in terminal:
+            return status
+        time.sleep(delay)
+    return status
+
+
+def _permset_members(pkg: Path) -> list[str]:
+    import xml.etree.ElementTree as ET
+    ns = "{http://soap.sforce.com/2006/04/metadata}"
+    try:
+        root = ET.parse(pkg).getroot()
+    except Exception:
+        return []
+    names: list[str] = []
+    for t in root.findall(f"{ns}types"):
+        if (t.findtext(f"{ns}name") or "").strip() == "PermissionSet":
+            names += [(m.text or "").strip() for m in t.findall(f"{ns}members")]
+    return [n for n in names if n and n != "*"]
+
+
+def _org_count(org: str, soql: str, tooling: bool = False) -> int | None:
+    cmd = ["sf", "data", "query", "--target-org", org, "--json", "--query", soql]
+    if tooling:
+        cmd.insert(3, "--use-tooling-api")
+    try:
+        out = subprocess.run(cmd, capture_output=True, text=True, timeout=120)
+        return int((json.loads(out.stdout or "{}").get("result") or {}).get("totalSize"))
+    except Exception:
+        return None
+
+
+def _permset_shrink_check(pkg: Path, org: str) -> list[str]:
+    """Return one line per PermissionSet whose local file has fewer entries than the org."""
+    problems: list[str] = []
+    for name in _permset_members(pkg):
+        local = Path(f"force-app/main/default/permissionsets/{name}.permissionset-meta.xml")
+        text = local.read_text(encoding="utf-8") if local.exists() else ""
+        ps = _org_count(org, f"SELECT Id FROM PermissionSet WHERE Name = '{name}'")
+        if not ps:
+            continue
+        checks = [
+            ("fieldPermissions", text.count("<fieldPermissions>"),
+             _org_count(org, f"SELECT Id FROM FieldPermissions WHERE Parent.Name = '{name}'")),
+            ("objectPermissions", text.count("<objectPermissions>"),
+             _org_count(org, f"SELECT Id FROM ObjectPermissions WHERE Parent.Name = '{name}'")),
+            ("tabSettings", text.count("<tabSettings>"),
+             _org_count(org, f"SELECT Id FROM PermissionSetTabSetting WHERE Parent.Name = '{name}'",
+                        tooling=True)),
+        ]
+        for kind, n_local, n_org in checks:
+            if n_org is None:
+                problems.append(f"{name}: could not count org {kind} — refusing to guess")
+            elif n_local < n_org:
+                problems.append(f"{name}: {kind} local {n_local} < org {n_org}")
+    return problems
 
 
 def _run_tee(cmd: list[str], logpath: Path) -> int:

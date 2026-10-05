@@ -14,8 +14,7 @@ from collections import defaultdict
 sys.path.insert(0, "scripts")
 from fetch_sheet import (get_sheets_service, find_header_row, build_col_map,
                          find_helper_cols, norm, GRAY_GUARD_SUBSTR, is_field_list_end, WIP_TRUE)
-
-SID = "1_TaxDe-Qxl8BAUmuZc01vUoxpBEPxJ4Opx4tEe8ulNQ"
+from sheet_config import DEFAULT_SPREADSHEET_ID as SID
 ORG = "ERPDEV01"
 AH_IDX = 33
 TABS = {  # tab -> (object api, object code for relname)

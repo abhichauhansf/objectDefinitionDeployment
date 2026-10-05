@@ -30,6 +30,10 @@ import argparse, json, os, re, subprocess, sys, urllib.request, urllib.error
 import xml.etree.ElementTree as ET
 from pathlib import Path
 
+from sheet_config import add_spreadsheet_id_arg
+from numeric_size import apply_numeric_size
+from rollup_h import apply_rollup_h, parse_rollup_h  # Updated by Divakar N — 2026-09-23
+
 # sheet "Data Type" -> (expected org base type, is_formula).
 # Keys are matched case-insensitively and after light normalization (see norm_dt).
 _RAW_SHEET_MAP = {
@@ -114,10 +118,23 @@ def read_org_object(api: str, tok: str, inst: str, ver: str) -> dict | None:
         return None  # object absent in org
     org = {}
     for f in root.iter("fields"):
-        d = {c.tag: (c.text or "") for c in f}
+        d = {c.tag: (c.text or "") for c in f if c.tag != "summaryFilterItems"}
         vals = [v.findtext("fullName", "") for v in f.iter("value")]
         if vals:
             d["_picklist"] = [x for x in vals if x]
+        # Updated by Divakar N — 2026-09-23.
+        # Why: a name-only / type-only drift check misses filter/operation edits
+        # on an existing Summary field (same gap as formula-body drift).
+        filters = []
+        for fi in f.findall("summaryFilterItems"):
+            filters.append({
+                "field": (fi.findtext("field") or "").strip(),
+                "operation": (fi.findtext("operation") or "").strip(),
+                "value": (fi.findtext("value") or "").strip(),
+                "valueField": (fi.findtext("valueField") or "").strip(),
+            })
+        if filters:
+            d["_summaryFilters"] = filters
         org[d.get("fullName", "")] = d
     # capture the standard Name field (nameField block on the CustomObject) so the
     # drift check can compare it too — it is NOT under <fields> and would otherwise
@@ -137,7 +154,7 @@ def main() -> int:
     ap.add_argument("--object", required=True, help="object API name, e.g. TI_Fnt_Deal__c")
     ap.add_argument("--rows", help="pre-fetched fetch_sheet JSON (skip live fetch)")
     ap.add_argument("--tab", help="sheet tab (for live fetch when --rows absent)")
-    ap.add_argument("--spreadsheet-id")
+    add_spreadsheet_id_arg(ap)
     ap.add_argument("--org", help="alias/username to mint a live session token")
     ap.add_argument("--token-file", default=".build/orgauth.json")
     ap.add_argument("--out", default=".build/attr_drift.json")
@@ -148,8 +165,8 @@ def main() -> int:
     if args.rows:
         rows = json.load(open(args.rows))
     else:
-        if not (args.tab and args.spreadsheet_id):
-            sys.exit("❌ need --rows OR (--tab and --spreadsheet-id)")
+        if not args.tab:
+            sys.exit("❌ need --rows OR --tab (spreadsheet defaults to sheet_config.py)")
         subprocess.run(["python3", "scripts/fetch_sheet.py", "--spreadsheet-id", args.spreadsheet_id,
                         "--tabs", args.tab, "--out", ".build/_attr_rows.json"], check=True)
         rows = json.load(open(".build/_attr_rows.json"))
@@ -182,8 +199,8 @@ def main() -> int:
             return int(float(s))
         except Exception:
             return s
-    def _sbool(v):  # sheet truthiness (TRUE/x/yes/1)
-        return str(v or "").strip().lower() in ("true", "x", "yes", "1")
+    def _sbool(v):  # sheet truthiness — must match generate_xml.is_truthy
+        return str(v or "").strip().lower() in ("true", "x", "yes", "1", "○", "〇")
     def _obool(v):  # org metadata boolean
         return str(v or "").strip().lower() == "true"
 
@@ -224,6 +241,41 @@ def main() -> int:
                 why.append(f"formula body differs (org={_of[:30]!r})")
         if exp_base in ("Lookup", "MasterDetail") and tsv and oref and oref != tsv:
             why.append(f"referenceTo: sheet={tsv} org={oref}")
+        if exp_base == "Summary":
+            # Updated by Divakar N — 2026-09-23.
+            # Why: "exists in org" is not "matches the sheet" for roll-ups.
+            apply_rollup_h(r)
+            parsed = r.get("_rollup") or parse_rollup_h(tsv)
+            if parsed.get("ok"):
+                def _lc(x):
+                    return str(x or "").strip().lower()
+                sop = _lc(om.get("summaryOperation"))
+                sheet_op = _lc(parsed["operation"])
+                # org may be Count/count/COUNT
+                if sheet_op and sop and sheet_op != sop:
+                    why.append(f"summaryOperation: sheet={parsed['operation']} org={om.get('summaryOperation')}")
+                sfk, ofk = parsed.get("child") or "", om.get("summaryForeignKey") or ""
+                if sfk and ofk and sfk != ofk:
+                    why.append(f"summaryForeignKey: sheet={sfk} org={ofk}")
+                ssum, osum = parsed.get("summarized_field") or "", om.get("summarizedField") or ""
+                if (ssum or osum) and ssum != osum:
+                    why.append(f"summarizedField: sheet={ssum or '(none)'} org={osum or '(none)'}")
+                def _fnorm(items):
+                    out = []
+                    for it in items or []:
+                        out.append((
+                            _lc(it.get("field")),
+                            _lc(it.get("operation")),
+                            it.get("valueField") or it.get("value") or "",
+                            "vf" if it.get("valueField") else "v",
+                        ))
+                    return out
+                sf = _fnorm(parsed.get("filters"))
+                of = _fnorm(om.get("_summaryFilters"))
+                if sf != of:
+                    why.append(f"summaryFilterItems: {len(sf)} sheet / {len(of)} org")
+            elif tsv:
+                why.append("sheet rollup H did not parse — cannot compare summary attributes")
         if exp_base in ("Picklist", "MultiselectPicklist") and om.get("_picklist"):
             # Normalize full-width JP punctuation (；->; ：->:) exactly like
             # generate_xml before splitting entries on ';'/newline, then take the
@@ -241,7 +293,8 @@ def main() -> int:
             svl, ovl = _num(r.get("Visible Lines")), _num(om.get("visibleLines"))
             if svl is not None and ovl is not None and svl != ovl:
                 why.append(f"visibleLines: sheet={svl} org={ovl}")
-        if exp_base in ("Number", "Currency", "Percent") and not exp_formula:
+        if exp_base in ("Number", "Currency", "Percent"):
+            apply_numeric_size(r)
             sp, op = _num(r.get("Precision")), _num(om.get("precision"))
             ssc, osc = _num(r.get("Scale")), _num(om.get("scale"))
             if sp is not None and op is not None and sp != op:

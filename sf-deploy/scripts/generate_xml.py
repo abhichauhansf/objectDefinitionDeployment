@@ -1,8 +1,20 @@
 from __future__ import annotations
 import json
 import re
+import sys
 from pathlib import Path
 import xml.etree.ElementTree as ET
+
+sys.path.insert(0, str(Path(__file__).resolve().parent))
+from relname import (  # noqa: E402
+    MAX_RELATIONSHIP_NAME,
+    derive_relationship_name,
+    is_standard_object,
+    qualify_relationship_name,
+)
+from numeric_size import apply_numeric_size, is_numeric_sheet_type  # noqa: E402
+from rollup_h import parse_rollup_h, summary_operation_xml  # noqa: E402  # Updated by Divakar N — 2026-09-23
+from fetch_sheet import apply_lookup_ref_from_g  # noqa: E402  # Updated by Divakar N — 2026-10-05
 
 NS = "http://soap.sforce.com/2006/04/metadata"
 ET.register_namespace("", NS)
@@ -94,6 +106,9 @@ def write_object_meta(
     root = ET.Element(qname("CustomObject"))
     set_text(root, "fullName", obj_api)
     set_text(root, "label", obj_label or obj_api)
+    # Salesforce requires pluralLabel on CustomObject create; JP labels use the
+    # same string for singular and plural (no English -s inflection).
+    set_text(root, "pluralLabel", obj_label or obj_api)
     if obj_desc:
         set_text(root, "description", obj_desc)
     set_text(root, "deploymentStatus", "Deployed")
@@ -266,6 +281,7 @@ _TYPE_MAP: dict[str, str] = {
     "geolocation(latitude/longitude)": "Location",
     "rollup": "Summary",
     "rollupsummary": "Summary",
+    "roll-upsummary": "Summary",  # Updated by Divakar N — 2026-09-23
     "集計": "Summary",
 }
 
@@ -465,9 +481,17 @@ def build_field_xml(row: dict) -> ET.Element | None:
     field_api = row.get("Field API Name", "").strip()
     raw_type = row.get("Data Type", "").strip()
     label = (row.get("Field Label") or row.get("Field Label (JA)") or "").strip()
+    # Updated by Divakar N — 2026-10-05. Blank col H on a lookup uses col G.
+    apply_lookup_ref_from_g(row)
     type_specific = str(row.get("Type Specific Value") or "").strip()
 
     sf_type, is_formula = normalize_type(raw_type)
+
+    # Number/Currency/Percent (+ formula): derive Precision/Scale from col F.
+    # Updated by Divakar N.
+    if is_numeric_sheet_type(raw_type) or (
+            is_formula and sf_type in ("Number", "Currency", "Percent")):
+        apply_numeric_size(row)
 
     # Reference target (used by Lookup/MasterDetail and the required-gate below).
     ref_to_val = str(row.get("Reference To") or type_specific or "").strip()
@@ -513,6 +537,17 @@ def build_field_xml(row: dict) -> ET.Element | None:
         # fields.  The separate defaultValue column must not be used as a
         # formula fallback.
         formula_expr = type_specific
+        # Sheet formulas sometimes write Lookup__c__r; Salesforce wants Lookup__r.
+        if "__c__r" in formula_expr:
+            formula_expr = formula_expr.replace("__c__r", "__r")
+            print(f"  ⚠️  {field_api}: formula used '__c__r' — normalized to '__r'.")
+        # '"TDB"' / '"TBD"' is only legal for Formula Text. Date/Checkbox/Number
+        # placeholders must be return-type dummies or Salesforce rejects compile.
+        placeholder = formula_expr.strip().strip('"').strip("'")
+        if placeholder in {"TDB", "TBD"} and sf_type != "Text":
+            formula_expr = _DUMMY_FORMULA.get(sf_type, '"TBD"')
+            print(f"  ⚠️  {field_api}: placeholder {type_specific!r} invalid for "
+                  f"Formula {sf_type} — injected dummy {formula_expr!r}.")
         if not formula_expr:
             # A formula field CANNOT deploy with an empty formula. Inject a
             # return-type-appropriate DUMMY so the field is deployable; the real
@@ -532,7 +567,11 @@ def build_field_xml(row: dict) -> ET.Element | None:
 
     elif sf_type == "TextArea":
         set_text(root, "type", "TextArea")
-        set_text_if(root, "length", row.get("Length"))
+        # Salesforce TextArea is always 255 chars. An explicit <length> is
+        # rejected: "Can not specify 'length' for a CustomField of type TextArea".
+        if str(row.get("Length") or "").strip():
+            print(f"  ℹ️  {field_api}: TextArea length '{row.get('Length')}' omitted "
+                  "(Metadata API fixes TextArea at 255; <length> is illegal).")
 
     elif sf_type == "LongTextArea":
         set_text(root, "type", "LongTextArea")
@@ -572,6 +611,19 @@ def build_field_xml(row: dict) -> ET.Element | None:
         restricted = is_truthy(row.get("Restricted", ""))
         global_set = str(row.get("Global Value Set") or "").strip()
         picklist_str = str(row.get("Picklist Values") or type_specific or "").strip()
+        # Known GlobalValueSet DeveloperNames. A tab with no GVS column stores
+        # the set name in col H (Prefectures). Do NOT treat a one-value inline
+        # list like "Prefecture" as a GVS — that is a different field.
+        _KNOWN_GVS = {
+            "ActiveStatus", "Prefectures", "ContinentArea", "RegionArea",
+            "ParentDepartment", "infoSharingSettings", "PPMTaskStatus",
+            "CPImportance", "ExportImportIncidentalExpensesStatus",
+            "PurchaseTerm_DomesticDeliveryConditions", "Route", "SharingSetting",
+        }
+        if not global_set and picklist_str in _KNOWN_GVS:
+            global_set = picklist_str
+            picklist_str = ""
+            print(f"  ℹ️  {field_api}: col H '{global_set}' treated as GlobalValueSet.")
         default_val = str(row.get("Default Value") or "").strip()
         if not _build_picklist_valueset(root, picklist_str, restricted, global_set, default_val):
             field_api = row.get("Field API Name", "").strip()
@@ -591,33 +643,59 @@ def build_field_xml(row: dict) -> ET.Element | None:
             set_text(root, "referenceTo", ref_to)
         rel_label = str(row.get("Relationship Label") or "").strip()
         rel_name = str(row.get("Relationship Name") or "").strip()
+        field_api = str(row.get("Field API Name") or "").strip()
+        obj_api = str(
+            row.get("Object API Name") or row.get("_SheetName") or ""
+        ).strip()
         if rel_label:
             set_text(root, "relationshipLabel", rel_label)
+        if not rel_name:
+            # col X blank: derive from the field API when col H has the lookup
+            # object. Shared-parent names are object-scoped (see relname.py).
+            if ref_to and field_api.endswith("__c"):
+                rel_name = derive_relationship_name(field_api, obj_api, ref_to)
+                row["Relationship Name"] = rel_name
+                row["_relname_autofilled"] = rel_name
+                print(
+                    f"  ℹ️  {obj_api}.{field_api}: blank relationshipName; "
+                    f"col H lookup '{ref_to}' → derived '{rel_name}'"
+                )
+            else:
+                print(
+                    f"⚠️  {obj_api}.{field_api}: blank 'relationshipName' for "
+                    f"a {sf_type} field and col H has no lookup object — "
+                    f"Salesforce REQUIRES this value."
+                )
+        elif len(rel_name) > MAX_RELATIONSHIP_NAME:
+            # Sheet value is illegal; do not emit it. Prefer a derived <=40 name.
+            derived = derive_relationship_name(field_api, obj_api, ref_to)
+            print(
+                f"  ⚠️  {obj_api}.{field_api}: relationshipName '{rel_name}' is "
+                f"{len(rel_name)} chars > {MAX_RELATIONSHIP_NAME}; "
+                f"using derived '{derived}'"
+            )
+            rel_name = derived
+            row["Relationship Name"] = rel_name
+            row["_relname_shortened"] = rel_name
+        # TI_Fnt_ fields on a TI_Logi_ object reuse sheet names coined for the
+        # TI_Fnt_ twin (e.g. CountryList_TINETAccount). Those collide on the
+        # parent. Qualify with Logi/Fnt/Stc before emit.
+        if (
+            rel_name
+            and field_api.startswith("TI_Fnt_")
+            and obj_api.startswith("TI_Logi_")
+        ):
+            qualified = qualify_relationship_name(rel_name, obj_api)
+            if qualified != rel_name:
+                print(
+                    f"  ℹ️  {obj_api}.{field_api}: relationshipName "
+                    f"'{rel_name}' collides with the TI_Fnt_ twin → '{qualified}'"
+                )
+                rel_name = qualified
+                row["Relationship Name"] = rel_name
+                row["_relname_qualified"] = rel_name
         if rel_name:
             set_text(root, "relationshipName", rel_name)
-        else:
-            # Salesforce REQUIRES <relationshipName> for Lookup /
-            # MasterDetail / Hierarchy fields, and the canonical value is
-            # ALWAYS dictated by the Org (visible to Pull-from-Org as
-            # `<relationshipName>` in the field-meta XML).  Auto-deriving
-            # one (e.g. `Account__c` → `Account`) is unsafe — it collides
-            # with built-in child relationship names on standard objects
-            # and the sheet's other Lookup fields.  We surface the
-            # missing value loudly so the operator can populate column
-            # `relationshipName` from the Org instead of letting the
-            # generator invent a name.
-            field_api = str(row.get("Field API Name") or "").strip()
-            obj_api = str(
-                row.get("Object API Name") or row.get("_SheetName") or ""
-            ).strip()
-            print(
-                f"⚠️  {obj_api}.{field_api}: blank 'relationshipName' for "
-                f"a {sf_type} field. Salesforce REQUIRES this value and we "
-                f"will NOT auto-derive it (collisions are silent). Run "
-                f"'Import Selected Sheets from Org to Repo' for this object "
-                f"so the canonical relationshipName flows into the sheet, "
-                f"then re-run Push."
-            )
 
     elif sf_type == "AutoNumber":
         set_text(root, "type", "AutoNumber")
@@ -637,7 +715,31 @@ def build_field_xml(row: dict) -> ET.Element | None:
         set_text(root, "scale", str(row.get("Scale") or "5").strip() or "5")
 
     elif sf_type == "Summary":
+        # Updated by Divakar N — 2026-09-23.
+        # Why: previously only ``<type>Summary</type>`` was written, so Salesforce
+        # rejected the field (missing summaryOperation / summaryForeignKey).
+        # Col H is the type-specific value; G is description and must not be read.
+        # Canonical H form: Operation:SUM (no space after the colon).
+        parsed = parse_rollup_h(type_specific)
+        if not parsed["ok"]:
+            print(f"Skipping {field_api}: rollup col-H parse failed — "
+                  + "; ".join(parsed["errors"]))
+            return None
         set_text(root, "type", "Summary")
+        op_xml = summary_operation_xml(parsed["operation"])
+        # WSDL SummaryOperations is lowercase count/sum/min/max.
+        set_text(root, "summaryOperation", op_xml)
+        set_text(root, "summaryForeignKey", parsed["child"])
+        if parsed["summarized_field"]:
+            set_text(root, "summarizedField", parsed["summarized_field"])
+        for item in parsed["filters"]:
+            fi = ET.SubElement(root, qname("summaryFilterItems"))
+            set_text(fi, "field", item["field"])
+            set_text(fi, "operation", item["operation"])
+            if item.get("valueField"):
+                set_text(fi, "valueField", item["valueField"])
+            else:
+                set_text(fi, "value", item.get("value", ""))
 
     else:
         # Unknown / pass-through — surface it to the deployer
@@ -725,6 +827,12 @@ def process_fields(rows: list[dict]) -> None:
         obj_api = row.get("Object API Name", "").strip()
         if not obj_api:
             continue
+        # Updated by Divakar N — 2026-09-23. Why: never emit CustomObject XML
+        # for Account/Opportunity/… — only CustomField members on that entity.
+        if is_standard_object(obj_api):
+            processed_objects.add(obj_api)
+            print(f"Skipped object metadata (standard object): {obj_api}")
+            continue
         write_object_meta(
             obj_api,
             row.get("Object Label", ""),
@@ -759,10 +867,15 @@ def process_fields(rows: list[dict]) -> None:
         if not field_api.endswith("__c"):
             continue
 
-        # Fallback: ensure object dir exists even if no object_meta row arrived
+        # Fallback: ensure object dir exists even if no object_meta row arrived.
+        # Standard objects: fields directory only — never a CustomObject stub.
+        # Updated by Divakar N — 2026-09-23.
         if obj_api not in processed_objects:
-            ensure_object_meta(obj_api, obj_label)
-            processed_objects.add(obj_api)
+            if is_standard_object(obj_api):
+                processed_objects.add(obj_api)
+            else:
+                ensure_object_meta(obj_api, obj_label)
+                processed_objects.add(obj_api)
 
         fields_dir = objects_dir / obj_api / "fields"
         fields_dir.mkdir(parents=True, exist_ok=True)

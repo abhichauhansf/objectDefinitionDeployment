@@ -16,11 +16,12 @@ sys.path.insert(0, "scripts")
 import fetch_sheet as F
 from fetch_sheet import find_helper_cols
 import write_back as WB
+from sheet_config import add_spreadsheet_id_arg
 
 
 def main() -> int:
     ap = argparse.ArgumentParser()
-    ap.add_argument("--spreadsheet-id", required=True)
+    add_spreadsheet_id_arg(ap)
     ap.add_argument("--tab", required=True)
     ap.add_argument("--plan", required=True, help="JSON list of {no,label_contains,api}")
     ap.add_argument("--apply", action="store_true")

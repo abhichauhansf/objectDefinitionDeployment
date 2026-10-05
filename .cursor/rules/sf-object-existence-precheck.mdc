@@ -20,9 +20,12 @@ batches every target object into ONE validated package + ONE deploy:
 # safe: prepare + validate + existence pre-check + check-only dry-run (no writes)
 python scripts/prep_deploy.py --org "<ORG>" --tabs "<tab1>,<tab2>,..."
 
+# REAL deploy: real start + live verify + report
+python scripts/prep_deploy.py --org "<ORG>" --phase deploy --tabs "<tab1>,<tab2>,..."
+```
 
-
-The orchestrator enforces the validation gate, existence pre-check, dry-run, real `deploy start`
+`--phase build` never writes to the org. `--phase deploy` writes to the org. The orchestrator
+enforces the validation gate, existence pre-check, dry-run, real `deploy start`
 (never a stale/dry-run log), mandatory `verify_deploy.py`, and per-object report
 refresh. Running the individual scripts by hand is still allowed, but the same
 gates below apply.

@@ -9,6 +9,7 @@ Input : .build/deal_tabs.json shaped as an ORDERED dict
 Output: force-app/main/default/flexipages/<PageDevName>.flexipage-meta.xml
 
 Structure (mirrors a real org tabbed page):
+  header (Region) — force:highlightsPanel  [required by recordHomeTemplateDesktop]
   main (Region)
     └ flexipage:tabset  (label=Tabs, tabs -> TABSET_TABS facet)
   TABSET_TABS (Facet)
@@ -30,6 +31,23 @@ NS = "http://soap.sforce.com/2006/04/metadata"
 ET.register_namespace("", NS)
 MAX_PER_COL = 100  # Salesforce hard cap: flexipage:column body max 100 items
 
+# Fields Lightning rejects as Dynamic Forms fieldInstance (highlights panel only).
+FLEXIPAGE_NOT_PLACEABLE = frozenset({
+    "Id", "IsDeleted", "SystemModstamp",
+    "LastViewedDate", "LastReferencedDate", "LastActivityDate",
+    "OwnerId",
+    "CreatedDate", "CreatedById", "LastModifiedDate", "LastModifiedById",
+})
+# Standard fields that ARE placeable. Anything else without ``__c`` is dropped:
+# it deploys but fails to render ("couldn't retrieve … Record.RecordType").
+STANDARD_PLACEABLE = frozenset({
+    "Name", "RecordTypeId",
+})
+# Sheet spellings that differ from the real API name.
+STANDARD_ALIASES = {
+    "RecordType": "RecordTypeId",
+}
+
 
 def qn(tag: str) -> str:
     return f"{{{NS}}}{tag}"
@@ -39,6 +57,27 @@ def st(parent: ET.Element, tag: str, text: str) -> ET.Element:
     el = ET.SubElement(parent, qn(tag))
     el.text = "" if text is None else str(text)
     return el
+
+
+def normalize_region_child_order(root: ET.Element) -> None:
+    """Force FlexiPageRegion children into the Metadata XSD sequence.
+
+    Sequence is ``itemInstances* , name, type``. Appending extra tabsets (or
+    any itemInstances) AFTER ``<name>``/``<type>`` is rejected as:
+      Element itemInstances is duplicated at this location in type FlexiPageRegion
+    """
+    for reg in root.findall(qn("flexiPageRegions")):
+        items = list(reg.findall(qn("itemInstances")))
+        name_el = reg.find(qn("name"))
+        type_el = reg.find(qn("type"))
+        for child in list(reg):
+            reg.remove(child)
+        for it in items:
+            reg.append(it)
+        if name_el is not None:
+            reg.append(name_el)
+        if type_el is not None:
+            reg.append(type_el)
 
 
 def indent(elem: ET.Element, level: int = 0):
@@ -61,6 +100,48 @@ def field_identifier(field_api: str, used: set) -> str:
         cand = f"{base}{i}"; i += 1
     used.add(cand)
     return cand
+
+
+def desktop_header_region() -> ET.Element:
+    """recordHomeTemplateDesktop ``header`` with a highlights panel."""
+    header = ET.Element(qn("flexiPageRegions"))
+    inst = ET.SubElement(header, qn("itemInstances"))
+    comp = ET.SubElement(inst, qn("componentInstance"))
+    for name, value in (
+        ("collapsed", "false"),
+        ("enableActionsConfiguration", "false"),
+        ("hideChatterActions", "false"),
+        ("numVisibleActions", "3"),
+    ):
+        p = ET.SubElement(comp, qn("componentInstanceProperties"))
+        st(p, "name", name)
+        st(p, "value", value)
+    st(comp, "componentName", "force:highlightsPanel")
+    st(comp, "identifier", "force_highlightsPanel")
+    st(header, "name", "header")
+    st(header, "type", "Region")
+    return header
+
+
+def desktop_sidebar_region() -> ET.Element:
+    """Empty ``sidebar`` region — required by recordHomeTemplateDesktop."""
+    sidebar = ET.Element(qn("flexiPageRegions"))
+    st(sidebar, "name", "sidebar")
+    st(sidebar, "type", "Region")
+    return sidebar
+
+
+def require_desktop_regions(root: ET.Element) -> None:
+    names = [
+        el.findtext(qn("name"))
+        for el in root.findall(qn("flexiPageRegions"))
+        if el.findtext(qn("type")) == "Region"
+    ]
+    missing = [r for r in ("header", "main", "sidebar") if r not in names]
+    if missing:
+        raise SystemExit(
+            f"recordHomeTemplateDesktop missing required regions: {missing}"
+        )
 
 
 def build_section(parent_region: ET.Element, facets: list, used_ids: set,
@@ -109,6 +190,7 @@ def build(page_dev: str, master_label: str, sobject: str,
     root = ET.Element(qn("FlexiPage"))
     facets: list[ET.Element] = []
     used_ids: set = set()
+    root.append(desktop_header_region())
 
     # main region holds ONLY the tabset component
     main = ET.SubElement(root, qn("flexiPageRegions"))
@@ -154,11 +236,14 @@ def build(page_dev: str, master_label: str, sobject: str,
     for fc in facets:
         root.append(fc)
 
+    root.append(desktop_sidebar_region())
     st(root, "masterLabel", master_label)
     st(root, "sobjectType", sobject)
     tmpl = ET.SubElement(root, qn("template"))
     st(tmpl, "name", "flexipage:recordHomeTemplateDesktop")
     st(root, "type", "RecordPage")
+    normalize_region_child_order(root)
+    require_desktop_regions(root)
     return root
 
 
@@ -177,13 +262,36 @@ def main() -> int:
     raw = json.load(open(args.tabs_json, encoding="utf-8"))
     tabs: "OrderedDict[str, OrderedDict[str, list]]" = OrderedDict()
     order = [t.strip() for t in args.tab_order.split(",") if t.strip()] or list(raw.keys())
+
+    def _filter_sections(sections) -> "OrderedDict[str, list]":
+        filtered: "OrderedDict[str, list]" = OrderedDict()
+        for sec, fields in OrderedDict(sections).items():
+            kept = []
+            for f in fields:
+                f = STANDARD_ALIASES.get(f, f)
+                if f in FLEXIPAGE_NOT_PLACEABLE:
+                    continue
+                if not f.endswith("__c") and f not in STANDARD_PLACEABLE:
+                    print(f"  ⚠️  standard field '{f}' is not placeable on a "
+                          f"record page — dropped")
+                    continue
+                if f not in kept:
+                    kept.append(f)
+            if kept:
+                filtered[sec] = kept
+        return filtered
+
     for t in order:
         if t in raw:
-            tabs[t] = OrderedDict(raw[t])
+            filtered = _filter_sections(raw[t])
+            if filtered:
+                tabs[t] = filtered
     # append any tabs not covered by explicit order
     for t in raw:
         if t not in tabs:
-            tabs[t] = OrderedDict(raw[t])
+            filtered = _filter_sections(raw[t])
+            if filtered:
+                tabs[t] = filtered
 
     root = build(args.page_dev, args.master_label, args.sobject, tabs, desired_cols=args.cols)
     indent(root)

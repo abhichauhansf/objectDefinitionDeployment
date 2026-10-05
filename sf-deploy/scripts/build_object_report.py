@@ -27,14 +27,16 @@ import json
 import os
 import subprocess
 import sys
+from pathlib import Path
 
 from openpyxl import Workbook, load_workbook
 from openpyxl.styles import Alignment, Border, Font, PatternFill, Side
 from openpyxl.utils import get_column_letter
 
+from sheet_config import add_spreadsheet_id_arg
+
 HERE = os.path.dirname(os.path.abspath(__file__))
 ROOT = os.path.dirname(HERE)
-DEFAULT_SHEET_ID = "1_TaxDe-Qxl8BAUmuZc01vUoxpBEPxJ4Opx4tEe8ulNQ"
 DEFAULT_WORKBOOK = os.path.join(ROOT, "reports", "Object_Deployment_Report.xlsx")
 CUSTOM_PREFIX = "TI_Fnt_"
 NCOLS = 4
@@ -64,6 +66,31 @@ def read_sheet_rows(f, sheet_id: str, sheet_tab: str):
         if f.is_field_list_end(c):
             break
         rows.append({k: (c[i] if i < len(c) else "") for k, i in idx.items()})
+    return rows
+
+
+def rows_from_temp(path: str):
+    """Build report rows from a live-parsed temp_updates.json (ADC-free).
+
+    Updated by Divakar N — 2026-09-23. Why: Sheets ADC has no quota project in
+    this environment, so the mandatory report tab could not refresh after the
+    Account roll-up deploy. The JSON is the same parse_tab() output.
+    """
+    data = json.loads(Path(path).read_text(encoding="utf-8"))
+    rows = []
+    n = 0
+    for r in data:
+        if r.get("_type") == "object_meta":
+            continue
+        n += 1
+        rows.append({
+            "no": str(n),
+            "std": "",
+            "label": r.get("Field Label") or "",
+            "full": r.get("Field API Name") or "",
+            "type": r.get("Data Type") or "",
+            "wip": "",
+        })
     return rows
 
 
@@ -245,16 +272,21 @@ def main():
     ap.add_argument("--target-org", required=True, help="Target org alias/username, e.g. ERPDEV01")
     ap.add_argument("--deploy-id", default="-", help="Deploy ID to record in the tab header")
     ap.add_argument("--fields-dir", default="", help="Generated fields dir (force-app .../fields) for the deploy set count")
-    ap.add_argument("--sheet-id", default=DEFAULT_SHEET_ID)
+    add_spreadsheet_id_arg(ap, dest="sheet_id", flag="--sheet-id")
     ap.add_argument("--workbook", default=DEFAULT_WORKBOOK)
     ap.add_argument("--tab-name", default="", help="Override worksheet tab name (defaults to object short name)")
     ap.add_argument("--sf-home", default="", help="Workspace-local HOME shim for the sf CLI (applied to the org-query subprocess only)")
     ap.add_argument("--xdg-data-home", default="", help="XDG_DATA_HOME for the sf subprocess (defaults to ~/.local/share)")
     ap.add_argument("--edits", default="", help="Sheet-edit audit JSON to render as a section (default: auto .build/sheet_edits_<Object>.json)")
+    ap.add_argument("--rows-json", default="",
+                    help="temp_updates.json from parse_tab (skip live Sheets fetch when ADC has no quota project)")
     args = ap.parse_args()
 
     f = load_fetch_module()
-    rows = read_sheet_rows(f, args.sheet_id, args.sheet_tab)
+    if args.rows_json:
+        rows = rows_from_temp(args.rows_json)
+    else:
+        rows = read_sheet_rows(f, args.sheet_id, args.sheet_tab)
     wip, standard, untyped, custom = categorise(rows)
     gen = generated_fields(args.fields_dir)
     genset = set(gen)

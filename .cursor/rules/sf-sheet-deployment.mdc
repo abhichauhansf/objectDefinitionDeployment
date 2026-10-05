@@ -18,8 +18,10 @@ every task. Never assume "the whole sheet", and never reuse a previous task's
 scope for a new task without re-confirming.
 
 1. List the available object tabs (run `python scripts/fetch_sheet.py
-   --spreadsheet-id <ID> --list-tabs`, or read them from a prior fetch) and
+   --list-tabs`, or read them from a prior fetch) and
    present them to the user (one option per tab, allow multiple).
+   Spreadsheet ID defaults to `scripts/sheet_config.py`; pass `--spreadsheet-id`
+   only to override.
 2. Wait for the user's explicit selection. That selection is the scope for the
    whole task: pass it as `--tabs "<tab1,tab2>"` to fetch/validate and
    `--only "<Obj1__c,Obj2__c>"` to the manifest.
@@ -32,7 +34,7 @@ scope for a new task without re-confirming.
 
 Working directory is always `sf-deploy/`.
 
-1. **Fetch** — `python scripts/fetch_sheet.py --spreadsheet-id <ID> [--tabs "<tab1,tab2>"]`
+1. **Fetch** — `python scripts/fetch_sheet.py [--tabs "<tab1,tab2>"]`
    Produces `temp_updates.json`. Uses the user's Google ADC creds
    (`gcloud auth application-default login --scopes=...spreadsheets,drive`).
 2. **Validate (HARD GATE)** — `python scripts/validate_sheet.py --in temp_updates.json --json .build/validation_report.json`
@@ -48,7 +50,7 @@ Working directory is always `sf-deploy/`.
    (see "Post-deploy report" below).
 
 Steps 1–4 can be run together with:
-`python scripts/run.py --spreadsheet-id <ID> [--tabs ...] [--only ...]`
+`python scripts/run.py [--tabs ...] [--only ...]`
 
 ## Incremental deploys
 
@@ -141,19 +143,37 @@ which strategy to use. This is the standing default (decided 2026-08-10):
 
 1. **Normalize object API** — ensure `Object API Name` ends with `__c`
    (e.g. `Sales_DealDetail` → `Sales_DealDetail__c`). Blank/invalid = source fix.
-2. **Name blank custom fields** — generate API names from the JP→EN glossary,
-   apply the `TI_Fnt_` prefix + `__c`, enforce ≤40 chars and per-object uniqueness
-   (see `sf-field-api-naming.mdc`, `sf-field-namespace-prefix.mdc`). Write back to
-   the sheet — GATED (sheet-write-confirmation). Never touch standard fields
-   (OwnerId, CreatedDate, …) or WIP rows.
+2. **Name blank custom fields (NOT a blocker)** — <!-- Updated by Divakar N -->
+   a blank Field API Name (col D) is **not** a validation/deploy blocker. Generate
+   API names from the JP→EN glossary, apply the `TI_Fnt_` prefix + `__c`, enforce
+   ≤40 chars and per-object uniqueness (see `sf-field-api-naming.mdc` §0b,
+   `sf-field-namespace-prefix.mdc`). Write back to the sheet — GATED
+   (sheet-write-confirmation). Never touch standard fields (OwnerId, CreatedDate,
+   …) or WIP / IsDelete rows. Do not stop at "blocked: blank API".
 3. **Fill empty formula bodies** — for Formula fields with an empty
    `Type Specific Value`, insert a generalized placeholder formula that matches the
    return type (Text → a placeholder text formula; Date → a generalized date
    formula) to unblock now; flag for later refinement. Highlight updated formula
-   rows green (Column A only).
-4. **Wire relationships** — for Lookup/MasterDetail, fill `Relationship Name` (col X)
-   = field API minus `__c`; set MasterDetail/Lookup `referenceTo` to the REAL parent
-   object API (e.g. 成約 → `Sales_Deal__c`).
+   rows green (Column A only). **Not for Rollup summary** — blank H is a hard
+   blocker (no dummy). Fill `Operation:COUNT` / `Child:…` / `Field:…` /
+   `Condition:…` in col H with **no space after the colon**
+   (`scripts/rollup_h.py`).
+   <!-- Updated by Divakar N — 2026-09-23. Why: formula dummy is safe; inventing
+        a roll-up operation/child would deploy the wrong aggregation. -->
+4. **Wire relationships** — for Lookup/MasterDetail, col H (`設定値`) is the
+   lookup object (`referenceTo`).
+   <!-- Updated by Divakar N — 2026-10-05. Why: relation detail is sometimes
+        only in col G. Check G when H is blank; do not do this for formulas,
+        picklists, or roll-ups. -->
+   If col H is blank, use col G (`データ型に応じて…` / referenceTo) only when
+   G is an object API name (`User`, `Foo__c`). H wins when both are filled.
+   Write a G-sourced object API back to col H (gated). Japanese prose in G
+   is not a target and is not copied into H.
+   If col X (`relationshipName`) is blank, check that lookup object: a
+   populated one means auto-fill X from the field API minus `__c`
+   (object-scoped for shared parents User/Account/…). Only blank X **and**
+   blank H **and** blank G is a blocker. Write the derived name back to col X
+   (gated).
 5. **Resolve or park cross-object lookups** — see next section.
 6. **Re-validate to 0 ERRORs → generate → build manifest → check-only dry-run →
    real deploy (`deploy.py --start`) → append the post-deploy report tab.** If the object does

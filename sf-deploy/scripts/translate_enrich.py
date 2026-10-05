@@ -299,6 +299,12 @@ def _pluralize_last_token(phrase: str) -> str:
     return " ".join(tokens)
 
 
+def ends_in_plural_word(label: str) -> bool:
+    """True when the label's last word is already plural (e.g. ``Trends``)."""
+    text = norm(label)
+    return bool(text) and _pluralize_last_token(text) == text
+
+
 def english_plural_label(singular: str) -> str:
     """Plural English object name for caseValues plural=true. Never written to the sheet.
 

@@ -12,7 +12,7 @@ user's Google credentials:
 
 Usage:
   python scripts/fetch_sheet.py \
-      --spreadsheet-id <ID> \
+      [--spreadsheet-id <ID>]          # default: scripts/sheet_config.py
       [--tabs "成約,輸入・入庫管理明細"]   # default: every object tab (auto-detected)
       [--out temp_updates.json]
 
@@ -29,8 +29,13 @@ from __future__ import annotations
 import argparse
 import json
 import os
+import re
 import sys
 import warnings
+
+from sheet_config import add_spreadsheet_id_arg
+from numeric_size import apply_numeric_size, is_numeric_sheet_type, numeric_size_mode_banner
+from rollup_h import apply_rollup_h, is_summary_type  # Updated by Divakar N — 2026-09-23
 
 warnings.filterwarnings("ignore")
 
@@ -69,6 +74,15 @@ API_HEADER_TO_KEY = {
 # so it follows the column regardless of its physical letter).
 COL_H_PREFIX = "displayformat"  # "displayFormat / referenceTo / formula / valueSet"
 COL_H_KEY = "Type Specific Value"
+# Col G (データ型に応じて…). Description for every type except Lookup /
+# Master-Detail, where it is the referenceTo fallback when col H is blank.
+# Updated by Divakar N — 2026-10-05.
+COL_G_KEY = "Type Specific Note"
+_LOOKUP_REF_TYPES = {
+    "lookup", "masterdetail", "hierarchy", "参照関係", "主従関係",
+}
+# Object API only (User, Account, Foo__c). Japanese prose in col G is not a target.
+_OBJECT_API_RE = re.compile(r"^[A-Za-z][A-Za-z0-9_]*$")
 
 # Tabs that are never object metadata sheets.
 NON_OBJECT_TABS = {
@@ -176,6 +190,33 @@ def norm(s) -> str:
     return str(s or "").strip()
 
 
+def apply_lookup_ref_from_g(rec: dict) -> bool:
+    """Lookup / Master-Detail: blank col H (設定値) falls back to col G.
+
+    Updated by Divakar N — 2026-10-05.
+    Why: the client sometimes leaves the lookup object only in col G
+    (データ型に応じて… / referenceTo). Column H stays the value when it is
+    filled. Formula, picklist, and roll-up rows never read G.
+
+    Returns True when referenceTo was copied from G into Type Specific Value.
+    """
+    raw = norm(rec.get("Data Type")).lower().replace(" ", "").replace("_", "").replace("-", "")
+    if raw not in _LOOKUP_REF_TYPES:
+        return False
+    if norm(rec.get(COL_H_KEY)):
+        return False
+    g = norm(rec.get(COL_G_KEY))
+    if not g:
+        return False
+    if not _OBJECT_API_RE.match(g):
+        # Checked G; it is a note, not an object API. Leave H blank.
+        rec["_referenceToGRejected"] = g
+        return False
+    rec[COL_H_KEY] = g
+    rec["_referenceToSource"] = "G"
+    return True
+
+
 def is_object_tab(title: str) -> bool:
     return title.strip().lower() not in {t.lower() for t in NON_OBJECT_TABS}
 
@@ -215,7 +256,9 @@ def build_col_map(header_row: list, jp_header_row: list | None = None) -> dict[i
     The client "Format" sheet has TWO polymorphic value columns whose machine
     API-header row is ambiguous — it carries ``defaultValue`` on BOTH the
     ``数式(設定値)`` column (the REAL type-specific value: formula body /
-    picklist values / referenceTo / displayFormat) AND the ``デフォルト値``
+    picklist values / referenceTo / displayFormat / roll-up setup
+    — Updated by Divakar N, 2026-09-23: H is also the Rollup summary block)
+    AND the ``デフォルト値``
     column (the real field default). It also carries
     ``displayFormat / referenceTo / formula / valueSet`` on the
     ``データ型に応じて…`` column, which in this sheet is only a human DESCRIPTION
@@ -227,8 +270,10 @@ def build_col_map(header_row: list, jp_header_row: list | None = None) -> dict[i
     mislabels G, we disambiguate by the UNIQUE Japanese header substrings:
       * ``設定値`` → ``数式(設定値)`` (col H)  → Type Specific Value
       * ``デフォルト`` → ``デフォルト値`` (col L) → Default Value
-    The ``データ型に応じて…`` column (col G) is a description → NOT read
-    (no fall back to G when H is blank; a blank H is surfaced as a blocker).
+    The ``データ型に応じて…`` column (col G) is a description for formula,
+    picklist, and roll-up rows. Updated by Divakar N — 2026-10-05: a
+    Lookup / Master-Detail whose col H is blank uses col G as referenceTo
+    (``apply_lookup_ref_from_g``). H wins when both are filled.
     """
     col_map: dict[int, str] = {}
     jp = [norm(c) for c in (jp_header_row or [])]
@@ -257,10 +302,11 @@ def build_col_map(header_row: list, jp_header_row: list | None = None) -> dict[i
                  "translation generated at"):
             col_map[idx] = API_HEADER_TO_KEY[h]
             continue
-        # 2) The 'displayFormat/referenceTo/formula/valueSet' header sits on the
-        #    DESCRIPTION column (col G) in this sheet — do NOT read it as the
-        #    value (client's real value is col H, handled above).
-        if h.startswith(COL_H_PREFIX):
+        # 2) Col G (displayFormat / referenceTo / …, JP データ型に応じて…).
+        #    Stored separately. Lookup / Master-Detail copy it into the value
+        #    only when col H is blank. Updated by Divakar N — 2026-10-05.
+        if h.startswith(COL_H_PREFIX) or "データ型に応じて" in jph:
+            col_map[idx] = COL_G_KEY
             continue
         # 3) Everything else maps by the English API header.
         if h in API_HEADER_TO_KEY:
@@ -407,6 +453,8 @@ def parse_tab(title: str, grid: list[list], object_api_hint: str = "") -> list[d
     name_field = {}
     wip_skipped = 0
     delete_skipped = 0
+    numeric_from_f = 0
+    rollup_parsed = 0
 
     def cell_at(cells, key):
         idx = helper[key]
@@ -445,6 +493,9 @@ def parse_tab(title: str, grid: list[list], object_api_hint: str = "") -> list[d
         if cell_at(cells, "isdelete").lower() in DELETE_TRUE:
             delete_skipped += 1
             continue
+        # Lookup / Master-Detail: blank col H uses col G as referenceTo.
+        # Updated by Divakar N — 2026-10-05.
+        apply_lookup_ref_from_g(rec)
         # capture Name field for the object's <nameField>
         if norm(rec.get("Field API Name")) == "Name":
             name_field = {
@@ -458,6 +509,20 @@ def parse_tab(title: str, grid: list[list], object_api_hint: str = "") -> list[d
                 "Name Translation Generated At": rec.get("Translation Generated At", ""),
             }
             continue
+        # Number/Currency/Percent: derive Precision/Scale from col F ("12, 3")
+        # so T/U are not required from the client (in-memory only; not a sheet write).
+        if is_numeric_sheet_type(rec.get("Data Type")):
+            st = apply_numeric_size(rec)
+            if st.get("ok") and st.get("source") == "F":
+                numeric_from_f += 1
+        # Updated by Divakar N — 2026-09-23.
+        # Why: Rollup summary setup is in col H (設定値), not G. Parse
+        # Operation:COUNT / Child:… / Field:… / Condition:… (no space after colon)
+        # here so generate/validate see it.
+        # Blank/unparseable H is a validator ERROR (no dummy, unlike formulas).
+        if is_summary_type(rec.get("Data Type")):
+            apply_rollup_h(rec)
+            rollup_parsed += 1
         field_rows.append(rec)
 
     obj_meta.update(name_field)
@@ -469,7 +534,9 @@ def parse_tab(title: str, grid: list[list], object_api_hint: str = "") -> list[d
     rows.extend(field_rows)
     wip_note = f", {wip_skipped} WIP(AE) skipped" if wip_skipped else ""
     del_note = f", {delete_skipped} IsDelete(AD) excluded" if delete_skipped else ""
-    print(f"  ✓ {title}: {len(field_rows)} field(s){wip_note}{del_note}, object_api='{obj_api or '?'}'")
+    f_note = f", {numeric_from_f} numeric size(s) from col F" if numeric_from_f else ""
+    ru_note = f", {rollup_parsed} rollup(s) from col H" if rollup_parsed else ""
+    print(f"  ✓ {title}: {len(field_rows)} field(s){wip_note}{del_note}{f_note}{ru_note}, object_api='{obj_api or '?'}'")
     return rows
 
 
@@ -493,12 +560,14 @@ def load_object_index(svc, spreadsheet_id: str) -> dict[str, str]:
 
 def main() -> int:
     ap = argparse.ArgumentParser(description="Fetch DD object tabs -> temp_updates.json")
-    ap.add_argument("--spreadsheet-id", required=True)
+    add_spreadsheet_id_arg(ap)
     ap.add_argument("--tabs", default="", help="comma-separated tab names; default=all object tabs")
     ap.add_argument("--list-tabs", action="store_true",
                     help="list the available object tabs and exit (scope-selection gate)")
     ap.add_argument("--out", default="temp_updates.json")
     args = ap.parse_args()
+
+    numeric_size_mode_banner()
 
     svc = get_sheets_service()
     meta = svc.spreadsheets().get(spreadsheetId=args.spreadsheet_id,

@@ -3,6 +3,8 @@ description: Semantics of the object-tab columns after relationshipName in the c
 alwaysApply: true
 ---
 
+<!-- Updated by Divakar N -->
+
 # Object-Tab Columns after relationshipName (client "Format" layout)
 
 These columns appear on every object-definition tab to the right of
@@ -10,6 +12,10 @@ These columns appear on every object-definition tab to the right of
 them in all field work. **Locate each column by its HEADER NAME** (the client
 keeps the order stable but header-driven lookup is mandatory and reshuffle-proof);
 the 0-based indices below are only a fallback.
+
+Column **F** (`サイズ` / length) is the client-facing size for text **and** for
+Number/Currency/Percent (`"12, 3"` → precision 15, scale 3). T/U are not
+client-filled. See `sf-numeric-size-column-f.mdc`.
 
 | Col | idx | Header | Meaning / handling |
 |-----|----:|--------|--------------------|

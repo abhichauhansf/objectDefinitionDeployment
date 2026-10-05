@@ -23,6 +23,419 @@ entries on top. Written by the self-correction loop (see
 
 ## Lessons
 
+### [2026-10-05] ERPPJ-1032 activation: false source-tracking conflict on a settings-only CustomObject deploy
+- **Error signature:** `Conflict │ TI_Fnt_Deal__c │ CustomObject` / `There are changes in the org that conflict with the local changes you're trying to deploy.`
+- **Command:** `sf project deploy start --manifest manifest/package.xml --target-org TI_ERPDEV01 --test-level NoTestRun --wait 60` (from `sf-deploy/work/erppj1032_activate/`)
+- **Component:** CustomObject `TI_Fnt_Deal__c` (object-meta only: View `actionOverrides` + `compactLayoutAssignment`)
+- **Category:** Tooling
+- **Root cause:** To activate the v2 record page and compact layout without redeploying the object's 227 local field files, the object was retrieved with `--target-metadata-dir` (mdapi), stripped to object-level settings and converted into a fresh, isolated sfdx project. That project has no source-tracking baseline, so every org-side change to the object counts as a "remote change" and the CLI flags a conflict. Nothing had actually changed: a fresh re-retrieve showed the object settings identical to the copy that was edited. The check-only run passed because `--dry-run` skips the conflict check. `deploy.py`'s auto-draft did not fire for this failure (no lesson was appended), so this entry was added by hand.
+- **Fix applied:** Re-retrieved the object and compared all object-level settings (children excluded) with the edited source → identical; then redeployed through `deploy.py --start --ignore-conflicts` (0AfBK00000CjyM50AJ, Succeeded). Verified live: View Large/Small → `TI_FnT_Deal_Lightning_Page_v2`, `compactLayoutAssignment` = `Deal_CompactLayout_v2`, field count unchanged by the deploy.
+- **Prevention added:** Procedure for settings-only object deploys from an isolated project: (1) retrieve mdapi, strip child arrays (`fields`, `listViews`, `compactLayouts`, `validationRules`, `webLinks`, `fieldSets`, `recordTypes`, `businessProcesses`, `sharingReasons`, `indexes`) so no stale field file is redeployed; (2) keep the stripped "before" copy as the rollback; (3) immediately before the real deploy, re-retrieve and confirm the object-level settings still equal the edited copy, and only then pass `--ignore-conflicts`. Never use `--ignore-conflicts` without that comparison. Project lives under `sf-deploy/work/` (not under a dot-folder: the CLI ignores hidden directories, so convert/retrieve there yields nothing).
+- **Status:** Resolved
+
+### [2026-10-05] Picklist with duplicate value LABELS (unique ApiNames)  «sig:9b521ce3b1»
+- **Error signature:** `Duplicate label: 有償（直送） (217:24)`
+- **Command:** `sf project deploy start --manifest manifest/dealdetail_update_package.xml --target-org TI_ERPDEV01 --test-level NoTestRun --wait 60 --dry-run --ignore-conflicts`
+- **Component:** CustomField `TI_Fnt_DealDetail__c.TI_Fnt_LineItemCategory__c`
+- **Category:** Schema
+- **Extracted failure lines:**
+    Status: Failed
+    Component Failures [1]
+    │ CustomField │ TI_Fnt_DealDetail__c.TI_Fnt_LineItemCategory__c │ Duplicate label: 有償（直送） (217:24) │ 217:24      │
+- **Root cause:** Salesforce requires picklist value LABELS to be unique, not just ApiNames. The sheet's col H for 明細カテゴリ lists 44 `Label:Code` pairs with unique SAP codes (YB11…YS28) but only 26 distinct labels (e.g. `有償（直送）` maps to both YB11 and YB21). `validate_sheet.py` only de-duplicated ApiNames, so it passed.
+- **Fix applied:** No generator change (labels come verbatim from the sheet; inventing distinct labels is a client/business decision). The field was held back from deploy pending a sheet fix.
+- **Prevention added:** `validate_sheet.py` picklist block: new ERROR `picklist.dup_label` (case-insensitive) alongside `picklist.dup`. Re-run on DealDetail now reports 18 duplicate labels before deploy.
+- **Status:** Monitoring (guard live; field still awaiting unique labels on the sheet)
+
+### [2026-10-05] IsDelete fields still placed on a FlexiPage; page-reference scan silently passed  «sig:d109451e13»
+- **Error signature:** `The <label> custom field is used in a component on the 成約明細 レコードページ Lightning page. : Lightning Page.` (9 CustomField failures)
+- **Command:** `sf project deploy start --manifest manifest/destructive_package.xml --target-org TI_ERPDEV01 --test-level NoTestRun --wait 60 --dry-run --pre-destructive-changes manifest/destructiveChanges.xml`
+- **Component:** CustomField `TI_Fnt_DealDetail__c.{ApplicableCategory, AppendixCargoNo, MinisterialOrdinanceNumber, PermitCategory, ReportFormType, PermitNumber, ApplicationDate, PermitDate, ExportPermitExpiry}__c`; FlexiPage `TI_Fnt_DealDetail_Record_Page`
+- **Category:** Dependency (+ Tooling bug)
+- **Extracted failure lines:**
+    Status: Failed
+    Component Failures [9]
+- **Root cause:** Salesforce refuses to delete a field that a Lightning record page still places. `build_destructive.flexipage_refs()` is meant to catch this, but it retrieved with `--target-metadata-dir` WITHOUT `--unzip`, so the output was a single `unpackaged.zip`; `rglob("*.flexipage*")` matched nothing and the scan returned "no references" — a false all-clear. A second real-deploy attempt then hit a source-tracking `Conflict` on the hand-edited page (org copy was unchanged since the base retrieve — verified by diff — so `--ignore-conflicts` was safe).
+- **Fix applied:** `scripts/build_destructive.py`: FlexiPage retrieve now passes `--unzip`; if the retrieve yields zero page files the scan fails CLOSED (every delete reported BLOCKED as unverified) instead of passing. Deploy path: removed the 9 `fieldInstance` items from the live page copy and deployed `FlexiPage` + `--post-destructive-changes` in one transaction (page first, then delete). Deploy `0AfBK00000CjmCt0AJ` Succeeded; Tooling `CustomField` confirms all 9 absent.
+- **Prevention added:** Fail-closed guard in `flexipage_refs()` (empty retrieve = BLOCKED). Delete sets that touch placed fields must ship the edited page with `--post-destructive`, never `--pre-destructive`. For a hand-edited page derived from a fresh org retrieve, diff the org copy before using `--ignore-conflicts`.
+- **Status:** Resolved
+
+### [2026-10-01] ERPPJ-1032 Deal page copy: CompactLayout missing fullName + CreatedDate not placeable  «sig:33458dec18»
+- **Error signature:** `element fullName missing for a child of type CompactLayout`; `FlexiPage TI_FnT_Deal_Lightning_Page_v2: Something went wrong. We couldn't retrieve or load the information on the field: Record.CreatedDate. (5044:28)`
+- **Command:** `sf project deploy start --manifest manifest/erppj1032_package.xml --target-org TI_ERPDEV01 --test-level NoTestRun --wait 60 --dry-run`
+- **Component:** CompactLayout `TI_Fnt_Deal__c.Deal_CompactLayout_v2`; FlexiPage `TI_FnT_Deal_Lightning_Page_v2`
+- **Category:** Schema
+- **Extracted failure lines:**
+    Status: Failed
+    Component Failures [2]
+    │ CompactLayout │                               │ element fullName missing for a child of type CompactLayout                                                     │             │
+    Warning: CompactLayout, , returned from org, but not found in the local project
+- **Root cause:** (1) A source-format `*.compactLayout-meta.xml` is a decomposed child of the CustomObject and must carry its own `<fullName>`; the new generator emitted only `<fields>`/`<label>`. (2) The review sheet places `CreatedDate`/`LastModifiedDate` in 「システム管理」. Dynamic Forms rejects those as `fieldInstance` (the live page proves `OwnerId`, `CreatedById`, `LastModifiedById`, `Name` ARE placeable — so the older `gen_tabbed_page.py` deny-list is stricter than needed).
+- **Fix applied:** `scripts/gen_deal_review_page.py`: `compact_layout_xml()` now writes `<fullName>`; field placement only accepts standard fields in `STANDARD_PLACEABLE` (`Name`, `OwnerId`, `CreatedById`, `LastModifiedById`, `RecordTypeId`) and reports the rest as INFO `field.standard`. Also auto-repairs sheet API typos (missing `__c`, copy-pasted `No1BranchNo` on rows 147-150) with WARN `sheet.api`. Re-run dry-run 0AfBK00000Ch2J00AJ: Succeeded.
+- **Prevention added:** Generator guards above (this is a page-only package; `validate_sheet.py` does not see it). The generator writes its own gate report `.build/erppj1032/validation_report.json` (ERROR on compact-layout fields missing from the org) that `deploy.py --validation-report` consumes.
+- **Status:** Resolved
+
+### [2026-10-01] Auto-derived relationshipName collided on a shared CUSTOM master parent  «sig:f131840617»
+- **Error signature:** `There is already a Child Relationship named TI_Fnt_Incoterms on インコタームズマスタ` / `… named TI_Fnt_Payer on BPマスタ`; knock-on `CustomObjectTranslation … no CustomField named TI_Fnt_DateOfArrival__c.TI_Fnt_Incoterms__c found`
+- **Command:** `sf project deploy start --manifest manifest/package.xml --target-org TI_ERPDEV01 --test-level NoTestRun --wait 60 --dry-run`
+- **Component:** CustomField `TI_Fnt_DateOfArrival__c.TI_Fnt_Incoterms__c` (→ `TI_Logi_IncotermsMaster__c`), `TI_Fnt_DateOfArrival__c.TI_Fnt_Payer__c` (→ `TI_Logi_TINETAccount__c`)
+- **Category:** Schema
+- **Extracted failure lines:**
+    Status: Failed
+    Component Failures [3]
+- **Root cause:** Col X was blank, so `relname.derive_relationship_name` used field-API-minus-`__c`. Object-scoping applied only to standard shared parents (User/Account/…), but widely referenced custom masters have the same problem: `TI_Fnt_Deal__c` already owns `TI_Fnt_Incoterms` / `TI_Fnt_Payer` on those parents. The existing `relationshipname.collision` guard never fired because describe reports child names as `Foo__r` and the guard compared them to bare `Foo` (case-sensitive), so it could never match.
+- **Fix applied:** `relname.py`: `derive_relationship_name` now takes the parent's live child-relationship names (`taken`; default = `.build/relname_taken.json` written by the validator, excluding the field's own relationship) and object-scopes on collision (`DOA_Incoterms`, numeric suffix if still taken). `generate_xml.py` picks this up via the same cache, so the generator and validator derive the same name. `TI_Fnt_DateOfArrival__c` col X written back as `DOA_Incoterms` / `DOA_Payer` / `TI_Fnt_DepartmentCode`.
+- **Prevention added:** `validate_sheet.py` strips `__r` from described child relationships and compares case-insensitively, so an explicit col X that collides is now an ERROR (`relationshipname.collision`). `--target-org` runs persist the cache, and offline runs delete it so it can't go stale. Verified offline (explicit `TI_Fnt_Incoterms` → ERROR; blank → `DOA_Incoterms`) and live against TI_ERPDEV01.
+- **Status:** Resolved
+
+### [2026-09-30] PermissionSet metadata deploy is a FULL REPLACE — partial file wiped SalesFrontAdmin
+- **Error signature:** none — deploy reported `Succeeded`. Afterwards the org's `SalesFrontAdmin` had FieldPermissions 0 (was 2591), ObjectPermissions 0 (was 50), PermissionSetTabSetting 0 (was 26), and only 2 recordTypeVisibilities. 60 users assigned.
+- **Command:** `deploy.py --start --package manifest/salesfrontadmin_rt_visibility.xml` with a local `SalesFrontAdmin.permissionset-meta.xml` holding ONLY the 2 new `recordTypeVisibilities`.
+- **Component:** PermissionSet `SalesFrontAdmin`
+- **Category:** Tooling
+- **Root cause:** A PermissionSet deploy through the Metadata API replaces the whole permission set with the file's contents. Any field, object or tab permission missing from the file is removed. The local file was also stale (Sep 24: 2210/45/18). Even a full-file deploy would have dropped every grant made since then through the data API (`grant_fls.py`, `grant_object_perms.py`, `grant_tab_visibility.py`).
+- **Fix applied:** Restored from the pre-deploy live snapshot (`.build/permset_before.json`: field Read/Edit, object RCED, tab visibility), plus the Sep 24 file for the older RT visibilities and viewAll/modifyAll. Deployed as one complete file. A live re-snapshot then diffed 0 missing / 0 extra on fields, objects and tabs, and all 7 RT visibilities are present. The local permset file was then replaced with a fresh retrieve from the org.
+- **Prevention added:** `deploy.py` now has a PermissionSet shrink gate (`_permset_shrink_check`). For every PermissionSet in the package it compares the local counts of fieldPermissions, objectPermissions and tabSettings with the org's live counts. If any local count is lower, or an org count can't be read, the deploy is blocked (exit 2). The only override is `--allow-permset-shrink`. Tested: the stale Sep 24 file is now blocked. Rule of thumb: grant additively through the data API. For record-type visibility, always retrieve the permission set from the org first and edit that copy.
+- **Status:** Resolved
+
+### [2026-09-30] AUTO-DRAFT: deploy validate (dry-run) failed (exit 1)  «sig:62b75f81da»
+- **Error signature:** (none extracted)
+- **Command:** `sf project deploy start --manifest manifest/salesfrontadmin_rt_visibility.xml --target-org TI_ERPDEV01 --test-level NoTestRun --wait 60 --dry-run`
+- **Component:** PermissionSet `SalesFrontAdmin` (restore file, tabSettings)
+- **Category:** Schema
+- **Extracted failure lines:**
+    Status: Failed
+    Status: Failed
+    Component Failures [1]
+    │ PermissionSet │ SalesFrontAdmin │ Error parsing file: 'DefaultOn' is not a valid value for the enum 'PermissionSetTabVisibility' (13440:43) │ 13440:43    │
+- **Root cause:** The tab-visibility values were copied straight from the Tooling `PermissionSetTabSetting.Visibility` values (`DefaultOn`/`DefaultOff`/`Hidden`). The Metadata API `PermissionSetTabVisibility` enum uses different words: `Visible`/`Available`/`None`. The two APIs are not interchangeable.
+- **Fix applied:** Mapped DefaultOn→Visible, DefaultOff→Available, Hidden→None in the restore file. The dry run then passed, and so did the real deploy.
+- **Prevention added:** Knowledge-base note only. No generator writes permset tabSettings XML; tab visibility goes through `grant_tab_visibility.py` (Tooling, `DefaultOn`). Any hand-built PermissionSet XML must use `Visible`/`Available`/`None`.
+- **Status:** Resolved
+
+### [2026-09-30] AUTO-DRAFT: deploy start failed (exit 10)  «sig:9323be3033»
+- **Error signature:** (none extracted)
+- **Command:** `sf project deploy start --manifest manifest/flexipage_salescontractapplication.xml --target-org TI_ERPDEV01 --test-level NoTestRun --wait 60`
+- **Component:** FlexiPage `TI_Fnt_SalesContractApplication_Record_Page`
+- **Category:** Environment/Org (Tooling side-effect)
+- **Extracted failure lines:**
+    Error (MetadataTransferError): Metadata API request failed: fetch failed
+- **Root cause:** Not a metadata error. The sf CLI lost its HTTP connection while polling the deploy job and exited 10. The job kept running server-side and finished `Succeeded` (job `0AfBK00000CgC5t0AF`, 1 component, 0 errors; page confirmed live via `listMetadata FlexiPage`). `deploy.py` treated any non-zero sf exit as a failed deploy, so a transport drop produced a false failure.
+- **Fix applied:** `scripts/deploy.py` — on a non-zero exit whose log shows `MetadataTransferError … fetch failed`, it now polls `sf project deploy report --use-most-recent` until the job is terminal, appends the server-side status to `.build/last_deploy.log`, and returns 0 only when that status is `Succeeded`. Any other status still takes the failure path (context + DRAFT lesson).
+- **Prevention added:** Not sheet-related, so no `validate_sheet.py` guard applies; the guard is the server-side status check in `deploy.py` above. Live post-deploy verification (listMetadata / `verify_deploy.py`) remains mandatory regardless of the reconciled status.
+- **Status:** Monitoring (org=TI_ERPDEV01; flip to Resolved after the next transport drop is reconciled automatically)
+
+### [2026-09-25] Object English ending in a plural word → "plural identical to singular" abort
+- **Error signature:** `⛔ object plural English is identical to singular ('Txn Approval Request Performance Trends')`
+- **Command:** `python scripts/prep_deploy.py --org TI_ERPDEV01 --tabs TradeTermsAppPerfHistory` (step 6/8, `generate_object_translation.py`)
+- **Component:** CustomObjectTranslation `TI_Fnt_TradeTermsAppPerfHistory__c-en_US` / top-level `caseValues`
+- **Category:** Tooling
+- **Root cause:** `translate_enrich.english_plural_label` intentionally leaves an already-plural last word unchanged (`Trends`, `Details`), but `generate_object_translation.py` rejected ANY plural equal to the singular. The two halves of the translation tooling contradicted each other, so every object whose English ends in a plural word failed before packaging. Salesforce accepts identical singular/plural caseValues.
+- **Fix applied:** added `translate_enrich.ends_in_plural_word()`; the generator now rejects an identical plural only when the last word is NOT already plural. Redeployed; live verify confirmed object label + plural + 10 field/Name labels.
+- **Prevention added:** the generator guard still fires for a genuine pluralization failure (e.g. plural dropped because it would exceed 40 chars), so a silent singular-as-plural cannot slip through; already-plural labels are no longer false positives.
+- **Status:** Resolved
+
+### [2026-09-24] RecordType developer names: hyphen is illegal; Metadata API cannot delete RecordTypes
+- **Error signature:** `The Record Type Name field can only contain underscores and alphanumeric characters` AND `Cannot delete record type through API` AND `The label:… is not unique`
+- **Command:** destructive delete of `TI_Logi_Customer_RecType` / `TI_Logi_ShipToParty_RecType`; create of `TI_Fnt_Ship-toParty_RecType`
+- **Component:** RecordType on `TI_Logi_TINETAccount__c`
+- **Category:** Schema
+- **Root cause:** (1) DeveloperName allows only `[A-Za-z][A-Za-z0-9_]*` — a hyphen (`Ship-toParty`) is rejected. (2) Metadata API cannot delete RecordTypes; REST delete returned `INSUFFICIENT_ACCESS_OR_READONLY`. Deactivate (`IsActive=false`) works. (3) Creating a replacement RT with the same label as an inactive RT fails (`label is not unique`) until the retired RT's Name is changed.
+- **Fix applied:** Reverted sheet names (sheet is source of truth). Created `TI_Fnt_Customer_RecType` after renaming the retired Logi Customer label. Did not invent a hyphen-free ship-to API name. Retired Logi RTs left inactive for Setup UI delete.
+- **Prevention added:** Before deploying a RecordType, validate DeveloperName against `^[A-Za-z][A-Za-z0-9_]*$`. Never rewrite the sheet to make a name deployable unless the user asks. Never assume Metadata API can delete RecordTypes — deactivate, then ask the user to delete in Setup.
+- **Status:** Resolved
+
+### [2026-09-24] Cannot convert Text → Formula in place — delete+recreate, and strip Flow/Apex refs first
+- **Error signature:** `Cannot update a field to a Formula from something else` AND `This custom field is referenced elsewhere … Flow Version / Apex Class`
+- **Command:** `deploy.py` in-place update of `TI_Logi_TINETAccount__c.LegalEntityCD__c`; earlier pre-destructive delete of the same field
+- **Component:** CustomField `TI_Logi_TINETAccount__c.LegalEntityCD__c`
+- **Category:** Schema | Dependency
+- **Root cause:** Salesforce rejects changing an existing Text field into a Formula. Delete+recreate is required, but delete is blocked while ANY Flow version (including Obsolete) or Apex references the field. Obsolete versions and paused Flow Interviews also count. A formula field is not insertable, so Apex test factories that assign the field on insert must drop that assignment permanently.
+- **Fix applied:** (1) Removed `LegalEntityCD__c` assignments from `TI_Logi_TINETAccount__c` inserts in `TI_Logi_TestRestDataFactory`. (2) Stubbed reads in `DemoFlow_DealTrigger_UpdateSoldToPartyCode` and `TI_Logi_TINETAccountAccountForSectionsSet`, deployed, deleted Obsolete Flow versions (and one paused Flow Interview), destructively deleted the field, recreated as Formula Text `AccountForSections__r.ViewLegalEntityCD__c`, restored the Flow reads. (3) FlexiPage fieldInstances were removed before the delete and regenerated after.
+- **Prevention added:** `generate_xml.py` now treats a known GlobalValueSet name in col H (`Prefectures`, `ActiveStatus`, …) as `valueSetName`, not a 1-value inline list. For type drift Text→Formula / Text→Picklist: never attempt an in-place field update; always (a) list Tooling/Metadata dependencies (Flow including Obsolete, Apex, FlexiPage), (b) strip page + stub refs, (c) delete, (d) recreate. `attr_drift.py` already surfaces these as type drift — do not skip that report.
+- **Status:** Resolved
+
+### [2026-09-24] Field delete blocked by Flow versions (active, obsolete, AND paused interviews)
+- **Error signature:** `This custom field is referenced elsewhere in salesforce.com. : Flow Version - 301… / Apex Class - TI_Logi_TestRestDataFactory`
+- **Command:** `deploy.py --pre-destructive manifest/tinet_typefix_destructive.xml` (LegalEntityCD__c + Prefecture__c)
+- **Component:** CustomField `TI_Logi_TINETAccount__c.LegalEntityCD__c`
+- **Category:** Dependency
+- **Extracted failure lines:** Component Failures [2] on LegalEntityCD__c (Prefecture deleted cleanly once isolated)
+- **Root cause:** Same as the Text→Formula lesson: delete is FLS-independent metadata-dependency gated. Prefecture had no Flow/Apex refs so it deleted after the FlexiPage strip. LegalEntityCD did not. Deleting an Obsolete Flow version can itself fail with `DEPENDENCY_EXISTS` if a Flow Interview still points at it.
+- **Fix applied:** Isolated Prefecture into its own destructive deploy. For LegalEntityCD, stubbed deps, deleted Flow Interviews then Obsolete versions, then the field.
+- **Prevention added:** Before a type-change delete, query `Flow` (all statuses) and `FlowInterview`, plus Apex `SymbolTable`/retrieve. Strip FlexiPage fieldItems in an earlier deploy (same lesson as deleting a CustomObject).
+- **Status:** Resolved
+
+### [2026-09-24] `attr_drift.py` did not read `○` as TRUE — false drift on Required/Unique/ExternalID
+- **Error signature:** drift reported `required: sheet=False org=True` (`ActiveStatus__c`) and `externalId: sheet=False org=True` (`SupplierCode__c`) while the sheet cells plainly read `○`
+- **Command:** `python scripts/attr_drift.py --object TI_Logi_TINETAccount__c --rows temp_updates.json --org TI_ERPDEV01`
+- **Component:** `scripts/attr_drift.py::_sbool` (line ~202)
+- **Category:** Tooling
+- **Root cause:** The client marks boolean columns (`Required`, `Unique`, `External ID`, `Track History`) with the Japanese circle `○`/`〇`, never `TRUE`. `generate_xml.is_truthy` accepts `○`/`〇`, but `attr_drift._sbool` only accepted `true/x/yes/1`, so the two readers disagreed. Every `○`-marked row was compared as sheet=False. That produces false-positive drift when the org is true (seen here), and — far worse — SILENTLY HIDES real drift in the opposite direction: a field the sheet marks `○` Required but that is optional in the org compares False-vs-False and reports in-sync.
+- **Fix applied:** `_sbool` now accepts `("true","x","yes","1","○","〇")`, matching `generate_xml.is_truthy`. Re-run on `TI_Logi_TINETAccount__c` dropped drift from 6 to 4 with no new entries, confirming both were false positives.
+- **Prevention added:** Sheet truthiness must be parsed in ONE place. Any new reader of a boolean sheet column must reuse `generate_xml.is_truthy` (or replicate its full set incl. `○`/`〇`) — never hand-roll a `in ("true","x","yes","1")` test. When a drift row's reason is a bare boolean flip, re-read the raw sheet cell before believing it.
+- **Status:** Resolved
+
+### [2026-09-24] Deleting a FlexiPage: omitting `actionOverrides` does NOT deactivate it
+- **Error signature:** `You can't delete an active Lightning page. Open the page in Lightning App Builder and click Activation to deactivate it.`
+- **Command:** `sf project deploy start --manifest manifest/tinetaccount_fnt_destructive_package.xml --target-org TI_ERPDEV01 --test-level NoTestRun --wait 30 --pre-destructive-changes manifest/tinetaccount_fnt_destroy_page.xml`
+- **Component:** FlexiPage `TI_Fnt_TINETAccount_Record_Page` (org default on `TI_Fnt_TINETAccount__c`)
+- **Category:** Dependency | Order-of-Execution
+- **Extracted failure lines:**
+    Component Failures [2]
+    │ FlexiPage │ TI_Fnt_TINETAccount_Record_Page │ You can't delete an active Lightning page …
+- **Root cause:** A FlexiPage assigned as an object's org default (GATE 2b `actionOverrides`) cannot be deleted until it is deactivated. The first deactivation attempt DELETED the two `View`/`Flexipage` `actionOverrides` blocks from the CustomObject and redeployed — but the Metadata API treats `actionOverrides` additively: an override that is simply ABSENT from the payload is left untouched in the org, so the page stayed active and the delete failed again with the identical error.
+- **Fix applied:** Deactivated explicitly by REPLACING each block with `<actionName>View</actionName><formFactor>Large|Small</formFactor><type>Default</type>` and deploying the CustomObject; the FlexiPage delete then succeeded, followed by the CustomTab + CustomObject delete.
+- **Prevention added:** To retire a record page, never just remove its override — always write an explicit `<type>Default</type>` View override for BOTH form factors, deploy the CustomObject, and only then run the destructive FlexiPage delete. Same rule applies when repointing a default (GATE 2b), where overwriting `<content>` is sufficient because the block is still present.
+- **Status:** Resolved
+
+### [2026-09-24] Deleting a whole CustomObject: its FlexiPage must go in an EARLIER deploy
+- **Error signature:** `The STC推進室コメント custom field is used in a component on the BPマスタ レコードページ Lightning page. : Lightning Page.` (× 217 components)
+- **Command:** `sf project deploy start --manifest manifest/tinetaccount_fnt_destructive_package.xml --target-org TI_ERPDEV01 --test-level NoTestRun --wait 30 --dry-run --pre-destructive-changes manifest/tinetaccount_fnt_destructive.xml`
+- **Component:** CustomObject `TI_Fnt_TINETAccount__c` + its 216 CustomFields, FlexiPage `TI_Fnt_TINETAccount_Record_Page`, CustomTab
+- **Category:** Order-of-Execution
+- **Extracted failure lines:**
+    Component Failures [217]
+    │ CustomField │ TI_Fnt_TINETAccount__c.TI_Fnt_STCAnnotation__c │ custom field is used in a component on the BPマスタ レコードページ Lightning page
+- **Root cause:** The destructive set listed the FlexiPage AND the CustomObject together, assuming `destructiveChanges.xml` type order would delete the page first. It does not: all deletions in one destructive payload are validated against the PRE-deploy org state, so every field still appeared to be referenced by the (not-yet-deleted) record page, failing all 217 components. This is the whole-object analogue of the 2026-09-15 field-delete lesson, which `build_destructive.flexipage_refs()` only guards for FIELD deletes.
+- **Fix applied:** Split into sequential deploys — (1) reset the object's `View` override to `Default`, (2) destructive-delete the FlexiPage, (3) destructive-delete the CustomTab + CustomObject. Each step verified live before the next.
+- **Prevention added:** Treat a page-owning object teardown as a 3-phase sequence, never one destructive payload. `build_destructive.flexipage_refs()` already blocks the field-level case; for object-level deletes, delete every FlexiPage whose `sobjectType` is the target object in a PRIOR deploy.
+- **Status:** Resolved
+
+### [2026-09-24] FlexiPage: sheet writes `RecordType`, only `RecordTypeId` is placeable
+- **Error signature:** `Something went wrong. We couldn't retrieve or load the information on the field: Record.RecordType. (203:22)`
+- **Command:** `sf project deploy start --manifest manifest/tinetaccount_logi_page_package.xml --target-org TI_ERPDEV01 --test-level NoTestRun --wait 30 --dry-run`
+- **Component:** FlexiPage `TI_Logi_TINETAccount_Record_Page`
+- **Category:** Schema
+- **Extracted failure lines:**
+    Component Failures [1]
+    │ FlexiPage │ TI_Logi_TINETAccount_Record_Page │ couldn't retrieve or load the information on the field: Record.RecordType │ 203:22
+- **Root cause:** The object tab lists the standard field as `RecordType` (the relationship), but the Dynamic-Forms-placeable field is `RecordTypeId`. `gen_record_page.py` used a DENY-list for standard fields: anything not in `HARD_DISALLOWED` / `STANDARD_NOT_PLACEABLE` and not ending `__c` skipped the org-presence check and was placed, so the unknown spelling went straight onto the page.
+- **Fix applied:** `gen_record_page.py` + `gen_tabbed_page.py` gained `STANDARD_ALIASES = {"RecordType": "RecordTypeId"}` applied before any filtering.
+- **Prevention added:** Both generators are now DEFAULT-DENY for standard fields — a non-`__c` field is placed only if it is in `STANDARD_PLACEABLE` (`Name`, `RecordTypeId`); anything else is dropped with a printed warning instead of shipping a page that deploys but will not render.
+- **Status:** Resolved
+
+### [2026-09-24] Lookup relationshipName collides across TI_Fnt_ / TI_Logi_ object twins
+- **Error signature:** `There is already a Child Relationship named CountryList_TINETAccount on 国マスタ` (same for CurrencyMaster / IncotermsMaster1/2 / PaymentTermsMaster)
+- **Command:** `sf project deploy start --manifest manifest/tinetaccount_logi_delta_package.xml --target-org TI_ERPDEV01 --test-level NoTestRun --wait 30 --dry-run`
+- **Component:** CustomField `TI_Logi_TINETAccount__c.TI_Fnt_CountryCode__c` (and CurrencyCode, Incoterms1/2, PaymentTermsCode)
+- **Category:** Schema
+- **Extracted failure lines:**
+    Component Failures [7]
+    │ CustomField │ TI_Logi_TINETAccount__c.TI_Fnt_CountryCode__c │ already a Child Relationship named CountryList_TINETAccount
+    │ CustomField │ TI_Logi_TINETAccount__c.TI_Fnt_CurrencyCode__c │ already a Child Relationship named CurrencyMaster_TINETAccount
+    │ CustomField │ TI_Logi_TINETAccount__c.TI_Fnt_Incoterms1__c │ already a Child Relationship named IncotermsMaster1_TINETAccount
+    │ CustomField │ TI_Logi_TINETAccount__c.TI_Fnt_Incoterms2__c │ already a Child Relationship named IncotermsMaster2_TINETAccount
+    │ CustomField │ TI_Logi_TINETAccount__c.TI_Fnt_PaymentTermsCode__c │ already a Child Relationship named PaymentTermsMaster_TINETAccount
+    (CountryName / CurrencyName formulas failed only because those lookups did not create)
+- **Root cause:** Child relationship names are unique on the PARENT object, not the child. Sheet col X reused `{Parent}_TINETAccount` names coined for `TI_Fnt_TINETAccount__c`. Deploying the same names onto `TI_Logi_TINETAccount__c` collides because both objects share the component `TINETAccount` after the `TI_Fnt_` / `TI_Logi_` prefix is stripped.
+- **Fix applied:** `relname.qualify_relationship_name` inserts Fnt/Logi/Stc (`CountryList_LogiTINETAccount`). `generate_xml.py` qualifies TI_Fnt_ lookups on a TI_Logi_ object before emit. This deploy used those five qualified names.
+- **Prevention added:** `validate_sheet.py` live-describes each lookup parent (`sf sobject describe`) and ERRORs `relationshipname.collision` when col X is already used by a different child object/field. In-memory qualify + INFO write-back when a TI_Fnt_ field lands on a TI_Logi_ object.
+- **Status:** Resolved
+
+### [2026-09-23] Account (standard object) roll-up fields: do not rewrite to Account__c
+- **Error signature:** `object.api` ERROR Object API 'Account' invalid (must end __c); or CustomObject Account stub in package
+- **Command:** deploy Account Summary fields from tab `Rollup Test` to SEAP-Conn
+- **Component:** CustomField Account.TI_Fnt_Opty*  (standard parent)
+- **Category:** Schema | Tooling
+- **Root cause:** Pipeline assumed every object API ends `__c`. `prep_deploy.patch_object_apis` rewrote Account → Account__c; validator ERROR'd; `generate_xml` would emit a fake CustomObject. Roll-up test fields must land on existing standard Account.
+- **Fix applied:** `relname.is_standard_object`. Validator allows known standard objects. generate_xml skips CustomObject XML (fields dir only). prep_deploy does not append `__c` to Account/Opportunity/….
+- **Prevention added:** `is_standard_object()` shared by validate / generate / prep_deploy. Manifest is CustomField-only for those entities.
+- **Status:** Resolved
+
+### [2026-09-23] FLS on standard objects: skip non-__c; Account CRUD needs Contact
+- **Error signature:** `INVALID_OR_NULL_FOR_RESTRICTED_PICKLIST` Field Name Account.Name/OwnerId/Person*; `FIELD_INTEGRITY_EXCEPTION` Permission Read Account depends on Read Contact
+- **Command:** `grant_fls.py --object Account`; `grant_object_perms.py --objects Account`
+- **Component:** FieldPermissions / ObjectPermissions on SalesFrontAdmin
+- **Category:** Dependency | Tooling
+- **Root cause:** `readMetadata(CustomObject)` for Account includes standard fields that cannot carry FieldPermissions. Account object Read on a permset requires Contact Read on Person-Account/FSC orgs.
+- **Fix applied:** `grant_fls.py` skips names that do not end `__c`. `grant_object_perms.py` grants Contact first (separate insert) when Account is in the set.
+- **Prevention added:** custom-only FLS filter; Contact-before-Account object-perm insert.
+- **Status:** Resolved
+
+### [2026-09-23] Formula compile: Long Text Area, `__c__r`, and typed `"TDB"` placeholders
+- **Error signature:** `unsupported field type called "Long Text Area"` / `Field …__r does not exist` / Formula Date/Checkbox with `"TDB"`
+- **Command:** `sf project deploy start --manifest manifest/tinetaccount_package.xml --target-org TI_ERPDEV01 --test-level NoTestRun --wait 30 --dry-run`
+- **Component:** CustomField `TI_Fnt_TINETAccount__c.TI_Fnt_STCAnnotation__c`, `TI_Fnt_CountryName__c`, `TI_Fnt_CurrencyName__c`
+- **Category:** Schema
+- **Extracted failure lines:**
+    Component Failures [3]
+    │ CustomField │ TI_Fnt_TINETAccount__c.TI_Fnt_CountryName__c │ Field CountryList_TINETAccount__r does not exist
+    │ CustomField │ TI_Fnt_TINETAccount__c.TI_Fnt_CurrencyName__c │ Field CurrencyMaster_TINETAccount__r does not exist
+    │ CustomField │ TI_Fnt_TINETAccount__c.TI_Fnt_STCAnnotation__c │ unsupported field type Long Text Area TI_STC_TISTCComment__c
+- **Root cause:** Formulas cannot reference Long Text Area fields. Same-object lookup formulas compile against the field API (`TI_Fnt_CountryCode__r`), not a custom relationshipName; `__c__r` and a space in the API also fail. `"TDB"` is only legal on Formula Text; Date/Checkbox need TODAY() / false.
+- **Fix applied:** Dummy STCAnnotation to `"TBD"`. Country/Currency formulas use `TI_Fnt_CountryCode__r` / `TI_Fnt_CurrencyCode__r`. Date placeholders → TODAY(), Checkbox → false. `generate_xml.py` normalizes `__c__r` → `__r` and replaces typed `"TDB"`/`"TBD"` on non-Text return types with dummies.
+- **Prevention added:** `validate_sheet.py` ERROR `formula.rel` on `__c__r`; WARN `formula.placeholder` when `"TDB"`/`"TBD"` is used on a non-Text formula return type.
+- **Status:** Resolved
+
+### [2026-09-23] Rollup summary is column H, labeled Operation/Child/Field/Condition
+<!-- Updated by Divakar N — 2026-09-23 -->
+- **Error signature:** `type>Summary</type>` with no `summaryOperation` / `summaryForeignKey` / `summarizedField` / `summaryFilterItems`; or treating col G as the roll-up setup
+- **Command:** fetch → validate → generate for `Rollup summary` rows
+- **Component:** CustomField Summary (roll-up)
+- **Category:** Schema | Tooling
+- **Root cause:** Format-tab H (`設定値`) is the type-specific value for every other type, but Summary XML was emitted as `<type>Summary</type>` only. Validator looked for non-existent columns `Summary Foreign Key` / `Summary Operation`. A col-G convention was considered, then corrected to H.
+- **Fix applied:** `scripts/rollup_h.py` parses H (`Operation:COUNT` / `Child:…` / `Field:…` / `Condition:…`, no space after the colon; symbol operators). `fetch_sheet.py` applies it; `validate_sheet.py` ERRORs blank/unparseable H (`summary.parse`); `generate_xml.py` emits the four Metadata API elements; `attr_drift.py` compares them.
+- **Prevention added:** blank H on Rollup summary is a hard blocker (no dummy). Reference: `.cursor/rules/sf-rollup-summary-column-h.mdc`.
+- **Status:** Resolved
+
+### [2026-09-21] Lookup relationshipName longer than 40 chars is undeployable
+- **Error signature:** `relationshipName` / `The relationship name is too long` / data value too large (Metadata API max 40)
+- **Command:** validate `TradeTermsAppBalanceHistory` (also seen on `TradeTermsAppCompanyTrade` the same day)
+- **Component:** CustomField Lookup `relationshipName` col X
+- **Category:** Schema
+- **Root cause:** Object-scoped child relationship names built as `<full object component>_<parent>` overflow Salesforce's 40-character `relationshipName` limit. Example: `TradeTermsAppBalanceHistory_TradeTermsApplication` is 49 chars. The validator previously only checked blank vs filled, so a too-long name passed STEP-0 and would fail at deploy.
+- **Fix applied:** Shorten to a unique object token + parent (`BalanceHistory_TradeTermsApplication`, 36 chars), matching `PerfHistory_` / `CompanyTrade_`. `generate_xml.py` no longer emits a >40 name; it falls back to `derive_relationship_name` (already capped).
+- **Prevention added:** `validate_sheet.py` ERROR `relationshipname.length` when col X exceeds `MAX_RELATIONSHIP_NAME` (40) in `relname.py`.
+- **Status:** Resolved
+
+### [2026-09-17] recordHomeTemplateDesktop without header/sidebar does not render
+- **Error signature:** Lightning record page "not coming" / blank at runtime while FlexiPage deploy Succeeded
+- **Command:** `gen_record_page.py` then `deploy.py --start` FlexiPage `TI_Fnt_CreditSecurityInfo_Record_Page`
+- **Component:** FlexiPage `TI_Fnt_CreditSecurityInfo_Record_Page`
+- **Category:** Schema
+- **Root cause:** `flexipage:recordHomeTemplateDesktop` requires Region names `header`, `main`, and `sidebar`. The generator emitted only `main` (field sections). Salesforce accepts the metadata deploy, but Lightning Runtime will not load the page.
+- **Fix applied:** `gen_record_page.py` and `gen_tabbed_page.py` now emit a `header` with `force:highlightsPanel` and an empty `sidebar`. Redeployed CSI page; live read confirms all three regions + org-default `defaultPages` Large/Small.
+- **Prevention added:** `require_desktop_regions()` in both generators exits non-zero if any of header/main/sidebar is missing.
+- **Status:** Resolved
+
+### [2026-09-17] Picklist Label:ApiName collides with existing JP values
+- **Error signature:** `Duplicate label: 追加`
+- **Command:** `sf project deploy start --manifest manifest/paymenttermsbplink_picklist.xml --target-org TI_ERPDEV01 --test-level NoTestRun --wait 60 --dry-run --ignore-conflicts`
+- **Component:** CustomField `TI_Fnt_PaymentTermsBPLink__c.TI_Fnt_PrimaryAdditionalCategory__c`
+- **Category:** Schema
+- **Extracted failure lines:**
+    Status: Failed
+    Component Failures [1]
+    │ CustomField │ TI_Fnt_PaymentTermsBPLink__c.TI_Fnt_PrimaryAdditionalCategory__c │ Duplicate label: 追加 (30:13) │ 30:13 │
+- **Root cause:** The field was first deployed with values `代表` / `追加` (label = stored value). Changing the sheet to `代表:Primary;追加:Additional` adds NEW value API names (`Primary`, `Additional`) that reuse the same labels. Salesforce picklist deploy MERGES the value set; the old JP fullNames remain, so labels `代表` and `追加` appear twice.
+- **Fix applied:** With 0 records, delete+recreate the field (strip it from the FlexiPage first — page refs block delete). Recreate with `Primary`/`Additional` as fullNames and JP labels. Did NOT set IsDelete on the sheet (the row is being kept).
+- **Prevention added:** Do not try to retarget an existing picklist from `Label` to `Label:ApiName` via a normal field update. Either (a) delete+recreate when the object has 0 rows, after stripping FlexiPage refs, or (b) keep the old fullNames and only change labels. `validate_sheet.py` still allows Label:ApiName (correct for NEW fields); this is an UPDATE-time collision.
+- **Status:** Resolved
+
+### [2026-09-17] Shared package.xml clobber → NothingToDeploy (real start)
+- **Error signature:** `Error (NothingToDeploy): No local changes to deploy.`
+- **Command:** `sf project deploy start --manifest manifest/package.xml --target-org TI_ERPDEV01 --test-level NoTestRun --wait 60`
+- **Component:** CustomObject `TI_Fnt_PaymentTermsBPLink__c` (intended); actual manifest had been overwritten to `TI_Fnt_CreditSecurityInfo__c`
+- **Category:** Tooling
+- **Extracted failure lines:**
+    Error (NothingToDeploy): No local changes to deploy.
+- **Root cause:** Same race as the dry-run sibling: shared `manifest/package.xml` was overwritten to CreditSecurityInfo before this start. Those members had no local delta, so the CLI reported NothingToDeploy. Not a Salesforce metadata defect.
+- **Fix applied:** Object-scoped `manifest/paymenttermsbplink_package.xml`. Do not reuse the shared package.xml while another tab's pipeline is running.
+- **Prevention added:** Same as the dry-run lesson — per-object `--out manifest/<object>_package.xml`. Confirm manifest members before start.
+- **Status:** Resolved
+
+### [2026-09-17] Shared package.xml clobber → NothingToDeploy
+- **Error signature:** `Error (NothingToDeploy): No local changes to deploy.`
+- **Command:** `sf project deploy start --manifest manifest/package.xml --target-org TI_ERPDEV01 --test-level NoTestRun --wait 60 --dry-run`
+- **Component:** CustomObject `TI_Fnt_PaymentTermsBPLink__c` (intended); actual manifest had been overwritten to `TI_Fnt_CreditSecurityInfo__c`
+- **Category:** Tooling
+- **Extracted failure lines:**
+    Error (NothingToDeploy): No local changes to deploy.
+- **Root cause:** `manifest/package.xml` is a shared disposable artifact. A parallel CreditSecurityInfo build overwrote it between our generate step and the retry dry-run. Source tracking then compared the CreditSecurityInfo members (already in the org / no local delta) and reported NothingToDeploy. PaymentTermsBPLink metadata was still on disk and was never in that manifest.
+- **Fix applied:** Built an object-scoped manifest `manifest/paymenttermsbplink_package.xml` and deployed from that path so the shared `package.xml` cannot steal the target set.
+- **Prevention added:** For any deploy that can race with another tab's `build_manifest.py`, write `--out manifest/<object>_package.xml` instead of the shared `manifest/package.xml`. When NothingToDeploy appears after a known-good generate, cat the manifest members first.
+- **Status:** Resolved
+
+### [2026-09-17] TextArea must not emit Metadata API `<length>`
+- **Error signature:** `Can not specify 'length' for a CustomField of type TextArea`
+- **Command:** `sf project deploy start --manifest manifest/package.xml --target-org TI_ERPDEV01 --test-level NoTestRun --wait 60 --dry-run`
+- **Component:** CustomField `TI_Fnt_PaymentTermsBPLink__c.TI_Fnt_ApplicationDetail__c`
+- **Category:** Schema
+- **Extracted failure lines:**
+    Status: Failed
+    Component Failures [1]
+    │ CustomField │ TI_Fnt_PaymentTermsBPLink__c.TI_Fnt_ApplicationDetail__c │ Can not specify 'length' for a CustomField of type TextArea (51:13) │ 51:13 │
+- **Root cause:** Salesforce `TextArea` (the 255-char multi-line type) has a fixed length. The Metadata API rejects an explicit `<length>` element. `generate_xml.py` copied the sheet Size cell into `<length>255</length>`, and `validate_sheet.py` incorrectly required Length for TextArea, which pushed us to fill that cell.
+- **Fix applied:** `generate_xml.py` omits `<length>` for TextArea (logs an INFO if the sheet has a size). Regenerated `TI_Fnt_ApplicationDetail__c` without `<length>`.
+- **Prevention added:** `validate_sheet.py` no longer requires Length on TextArea; if the sheet has a size it emits INFO `textarea.length` that the generator will omit it. LongTextArea/Html still require Length.
+- **Status:** Resolved
+
+### [2026-09-17] FlexiPageRegion itemInstances after name/type
+- **Error signature:** `Element itemInstances is duplicated at this location in type FlexiPageRegion`
+- **Command:** `sf project deploy start --manifest manifest/flexipage_shipping.xml --target-org TI_ERPDEV01 --test-level NoTestRun --wait 10 --dry-run`
+- **Component:** FlexiPage `TI_Fnt_Shipping_Record_Page`
+- **Category:** Schema
+- **Extracted failure lines:**
+    Status: Failed
+    Component Failures [1]
+    │ FlexiPage │ TI_Fnt_Shipping_Record_Page │ Error parsing file: Element itemInstances is duplicated at this location in type FlexiPageRegion (93:22) │ 93:22       │
+- **Root cause:** FlexiPageRegion's Metadata XSD sequence is `itemInstances*, name, type`. When merging the generated field tabset with the org page's RaySheet/related-list tabsets, the extra `<itemInstances>` were appended AFTER `<name>main</name>` / `<type>Region</type>`. The parser then reports those late siblings as a duplicated `itemInstances` element (not a true duplicate identifier).
+- **Fix applied:** Reordered every `flexiPageRegions` child list so all `itemInstances` precede `name`/`type`. Dry-run then real deploy of `TI_Fnt_Shipping_Record_Page` succeeded (Deploy ID 0AfBK00000CVB3V0AX). Added `normalize_region_child_order()` in `scripts/gen_tabbed_page.py` and call it at the end of `build()`.
+- **Prevention added:** `gen_tabbed_page.build()` now always normalizes region child order before write. Any merge that adds tabsets to an existing `main` region must insert them before `<name>`/`<type>`, never after.
+- **Status:** Resolved
+
+### [2026-09-17] AUTO-DRAFT: deploy validate (dry-run) failed (exit 1)  «sig:e75c18de20»
+- **Error signature:** (none extracted)
+- **Command:** `sf project deploy start --manifest manifest/flexipage_receiving.xml --target-org TI_ERPDEV01 --test-level NoTestRun --wait 60 --dry-run`
+- **Component:** FlexiPage `TI_Fnt_Receiving_Record_Page`
+- **Category:** Environment/Org (API-version mismatch between manifest and source)
+- **Extracted failure lines:**
+    Status: Failed
+    Component Failures [1]
+    │ FlexiPage │ TI_Fnt_Receiving_Record_Page │ Invalidnull property [label] in component [flexipage:tabset] │             │
+- **Root cause:** The hand-written `manifest/flexipage_receiving.xml` declared
+  `<version>62.0</version>` while the project's `sourceApiVersion` is `66.0` and the
+  page had been RETRIEVED at 66.0. The `label` property on `flexipage:tabset` only
+  exists in the newer schema, so validating the 66.0-shaped XML against the 62.0
+  metadata schema rejected it as an invalid/null property. The error was NOT caused
+  by the field edits being deployed and was NOT a real defect in the page.
+- **Fix applied:** Set the manifest `<version>` to `66.0` to match
+  `sfdx-project.json` → `sourceApiVersion`. Re-validated clean and deployed
+  successfully (Deploy ID 0AfBK00000CV3Ir0AL, then real deploy Succeeded).
+- **Prevention added:** Rule of thumb now recorded here — any hand-written
+  `manifest/*.xml` MUST carry the same `<version>` as `sfdx-project.json`'s
+  `sourceApiVersion`; a lower manifest version silently re-validates retrieved
+  metadata against an older schema and produces bogus "Invalid/null property
+  [X] in component [Y]" failures. When that error text appears, check the
+  manifest-vs-project API version FIRST before editing the metadata.
+- **Status: Resolved** (org=TI_ERPDEV01, log=.build/last_deploy.log)
+
+### [2026-09-15] AUTO-DRAFT: deploy start failed (exit 1)  «sig:7c8b9116ed»
+- **Error signature:** (none extracted)
+- **Command:** `sf project deploy start --manifest manifest/destructive_package.xml --target-org TI_ERPDEV01 --test-level NoTestRun --wait 60 --pre-destructive-changes manifest/destructiveChanges.xml --ignore-conflicts`
+- **Component:** CustomField TI_Fnt_Receiving__c.TI_Fnt_DepartmentCode__c and .TI_Fnt_PartnerBank__c (destructive delete)
+- **Category:** Dependency
+- **Extracted failure lines:**
+    Status: Failed
+    Component Failures [4]
+- **Root cause:** Both fields were still placed on the Lightning record page TI_Fnt_Receiving_Record_Page. Salesforce refuses to delete a field referenced by a FlexiPage component ("The <label> custom field is used in a component on the <page> Lightning page") and fails the ENTIRE destructive set with it — page references block a delete just as formula or layout references do.
+- **Fix applied:** Retrieved the FlexiPage, removed the two <itemInstances> blocks holding Record.TI_Fnt_DepartmentCode__c and Record.TI_Fnt_PartnerBank__c, deployed the page, deleted the fields, recreated them as Lookups, then redeployed the ORIGINAL page (backed up to .build/) so both fields returned to their exact former positions.
+- **Prevention added:** build_destructive.py now has flexipage_refs(): before writing destructiveChanges.xml it retrieves every FlexiPage in the org and maps each delete-set field to the pages referencing it. Any field still on a page BLOCKS the build (exit 2) and prints the page names, so the page-strip step happens up front instead of the delete failing at the org.
+- **Status:** Resolved — (auto-written by log_failure.py; agent must complete + flip to Resolved/Monitoring; org=TI_ERPDEV01, log=.build/last_deploy.log)
+
+### [2026-09-15] AUTO-DRAFT: deploy start failed (exit 1)  «sig:707ee2be5d»
+- **Error signature:** STATE
+- **Command:** `sf project deploy start --manifest manifest/destructive_package.xml --target-org TI_ERPDEV01 --test-level NoTestRun --wait 60 --pre-destructive-changes manifest/destructiveChanges.xml`
+- **Component:** CustomField TI_Fnt_Receiving__c.TI_Fnt_PartnerBank__c (destructive delete)
+- **Category:** Environment/Org
+- **Extracted failure lines:**
+    Error (1): There are changes in the org that conflict with the local changes you're trying to deploy.
+- **Root cause:** The org has source tracking enabled. The local TI_Fnt_PartnerBank__c.field-meta.xml (regenerated from the sheet with referenceTo TI_Logi_TINETAccount__c) differed from the org copy (referenceTo TI_Fnt_BankMaster__c), so the CLI classified the component as a Conflict and refused the deploy before reaching the org. This is a source-tracking guard, not a metadata error.
+- **Fix applied:** Re-ran the destructive deploy with --ignore-conflicts (deploy.py already exposes the flag). Safe here because the field was being deleted outright, so the org copy was discarded deliberately.
+- **Prevention added:** When deleting, or intentionally overwriting a drifted field, pass --ignore-conflicts to deploy.py. Treat "changes in the org that conflict" as the expected drift already surfaced by attr_drift.py, and confirm that drift is the one being discarded before using the flag.
+- **Status:** Resolved — (auto-written by log_failure.py; agent must complete + flip to Resolved/Monitoring; org=TI_ERPDEV01, log=.build/last_deploy.log)
+
+### [2026-09-15] AUTO-DRAFT: deploy validate (dry-run) failed (exit 1)  «sig:d513d6a762»
+- **Error signature:** (none extracted)
+- **Command:** `sf project deploy start --manifest manifest/package.xml --target-org TI_ERPDEV01 --test-level NoTestRun --wait 60 --dry-run`
+- **Component:** CustomField (27 members of TI_Fnt_Receiving__c) — manifest/package.xml
+- **Category:** Tooling
+- **Extracted failure lines:**
+    Error (ComponentSetError): No source-backed components present in the package.
+- **Root cause:** generate_xml.py writes force-app/ relative to the CURRENT WORKING DIRECTORY. It was run from sf-deploy/, so the metadata landed in sf-deploy/force-app, which is not a package directory of the sf project (sfdx-project.json at the workspace root declares only the root force-app). The sf CLI resolved the manifest against the project root, found no matching source files, and aborted with "No source-backed components present in the package" — the package never reached the org.
+- **Fix applied:** Re-ran the build from the project root so generated metadata lands in the root force-app (the declared package directory), then re-validated and deployed from there.
+- **Prevention added:** Run generate_xml.py / build_manifest.py / deploy.py from the sf project root (the directory holding sfdx-project.json), never from sf-deploy/. Read "No source-backed components present in the package" as a cwd/package-directory mismatch, not as missing metadata.
+- **Status:** Resolved — (auto-written by log_failure.py; agent must complete + flip to Resolved/Monitoring; org=TI_ERPDEV01, log=.build/last_deploy.log)
+
+### [2026-09-11] FlexiPage fieldInstance rejects CreatedDate/LastModifiedDate/OwnerId
+- **Error signature:** `Something went wrong. We couldn't retrieve or load the information on the field: Record.CreatedDate`
+- **Command:** `sf project deploy start --manifest package_qum_flexi.xml --target-org TI_ERPDEV01 --dry-run`
+- **Component:** `FlexiPage` `TI_Fnt_QuantityUnitMaster_Record_Page` (Record.CreatedDate)
+- **Category:** Schema
+- **Root cause:** `gen_tabbed_page.py` placed sheet standard audit/ownership fields as Dynamic Forms `fieldInstance`s. Lightning rejects them; `gen_record_page.py` already skipped them, the tabbed generator did not.
+- **Fix applied:** `gen_tabbed_page.py` now filters `FLEXIPAGE_NOT_PLACEABLE` and drops empty sections.
+- **Prevention added:** generator guard in `gen_tabbed_page.py`. `grant_tab_visibility.py` TabSetting reads now use Tooling.
 ### [2026-09-22] Isolated CustomObject description deploy hits source-tracking conflict
 - **Error signature:** `There are changes in the org that conflict with the local changes you're trying to deploy.` / `Conflict TI_Fnt_ShippingDetail__c CustomObject`
 - **Command:** `python scripts/deploy.py --start --package manifest/package.xml --target-org ERPDEV01 --test-level NoTestRun --skip-validation-gate` (cwd `.build/sd-desc-fix`)
