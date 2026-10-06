@@ -74,10 +74,19 @@ Scan for blockers including (non-exhaustive):
   (`設定値` / referenceTo) and col G are both blank.** If col X is blank but
   col H (or col G, when H is blank) has the lookup object, that is NOT a blocker:
   - field already in the org → write back the org's `relationshipName` to col X
-    (never invent a new child-relationship name on an existing field);
+    (never invent a new child-relationship name on an existing field). The org
+    value is read live (`readMetadata`, FLS-independent) by `validate_sheet.py
+    --target-org` and used by `generate_xml.py`; a filled col X that differs
+    from the org is a WARN and the org value is kept. If the org cannot be
+    read, blank X is an ERROR — never fall back to deriving;
   - new field → auto-fill from the field API (minus `__c`; object-scoped for
     shared parents like User) via `relname.derive_relationship_name`, write it
-    back to col X, and proceed.
+    back to col X, and proceed. Length shortening and Fnt/Logi qualifying also
+    apply to new fields only.
+  <!-- Updated by Divakar N — 2026-10-06. Why: the generator always derived X,
+       even for fields already in the org. -->
+  - `fill_relationship_name.py --target-org <ORG>` writes back with the same
+    split (org value for existing fields, derived for new ones).
 - API names violating `sf-field-api-naming.mdc` / `sf-field-namespace-prefix.mdc`
   (bad pattern, `> 40` chars, missing `__c`, wrong/duplicated prefix).
 - Duplicate API names within the object (case-insensitive collisions).
@@ -191,13 +200,36 @@ and deploy ONLY the new (and, if explicitly requested, changed) fields.
    length, visibleLines, precision, scale, required, unique, and
    externalId** (and flags any unmapped Data Type). It writes
    `.build/attr_drift_<Obj>.json`. `prep_deploy.py` runs this automatically in its
-   build phase (step 6b). SURFACE any drift to the user. Redeploying drift is a user decision, not automatic — many type changes
-   (Lookup↔Formula, Checkbox↔Picklist, Text→Lookup) require delete+recreate and
-   DESTROY the field's data, so never silently redeploy a drifted field.
+   build phase (step 6b). SURFACE any drift to the user. Redeploying drift is a
+   user decision, not automatic — many type changes (Lookup↔Formula,
+   Checkbox↔Picklist, Text→Lookup) require delete+recreate and DESTROY the
+   field's data, so never silently redeploy a drifted field.
+3c. **TRANSLATION-LEVEL DRIFT (MANDATORY for fields present in BOTH).** The name
+   delta also does NOT prove the **English label** matches the sheet. A field
+   whose `Field Label (EN)` / `Translation Provenance` changed (Google, DeepL,
+   or a manual edit) while its API name stayed the same is invisible to
+   `sheet_custom_fields − org_existing_fields` and must still be packaged as
+   `CustomObjectTranslation` (`CHANGED_TRANSLATION`). `prep_deploy.py` prints
+   this as a separate TRANSLATIONS delta (new / changed / unchanged). Post-deploy
+   `verify_deploy.py` compares **every** in-scope sheet English value to the live
+   org — not only the rows that happened to be in this package — so a later EN
+   edit cannot be reported as "complete" while the org still has the old label.
+3d. **JAPANESE LABEL DRIFT — THE SHEET OVERWRITES THE ORG (automatic).** The
+   sheet is the master for Japanese labels. For every existing object,
+   `prep_deploy.py` compares the sheet `Object Label`, `Name Field Label` and
+   each custom `Field Label` with the org (`readMetadata`, FLS-independent) and
+   packages every difference, printed as `LABELS (JA)`. An org-side Japanese
+   edit must never silently survive a deploy. `label_sync.py` builds the relabel
+   from the org's CURRENT definition with only `<label>` replaced, so it never
+   redeploys attribute drift (§3b stays a user decision). Relabelling an object
+   also pins its local field files to the org definition, because a CustomObject
+   source deploy pushes every child field file. `verify_deploy.py --plan` fails
+   if a planned relabel did not land.
 4. **Report the delta before deploying:** e.g. "org already has N fields; sheet
    defines M; deploying the D new ones; X already present (skipped); Y org-only
-   (left untouched)." Keep the package limited to the delta so redeploys stay
-   fast and side-effect-free.
+   (left untouched)." **Also report translation new/changed.** Keep the schema
+   package limited to the field-name delta so redeploys stay fast; still include
+   every CHANGED/NEW English label in the translation package.
 5. Package + validate (check-only dry-run) the delta, then deploy for real with
    `deploy.py --start` (the ONLY flag that writes).
 6. **Log every on-the-go fix in TWO places — the value cell AND the AH note.**
@@ -229,8 +261,19 @@ package; `build_destructive.py` handles the actual deletion:
    `--target-org` verifies each field EXISTS in the org (Tooling API) — fields
    already absent are dropped as no-ops. It writes `manifest/destructiveChanges.xml`
    (CustomField members `<Obj>__c.<Field>__c`) + an empty `manifest/destructive_package.xml`.
-2. **Review** the printed delete set with the user — deletion is irreversible and
-   also destroys the field's data.
+   <!-- Updated by Divakar N — 2026-10-06. Why: Salesforce refuses to delete a
+        field that a Lightning page still places. -->
+   With `--target-org` it also scans the org's FlexiPages and exits **2
+   (BLOCKED)** if a field to delete is still placed on a Lightning page.
+1b. **Unplace from the Lightning page first (the ONE page-freeze exception).**
+   Lightning pages are otherwise frozen after first object create
+   (`sf-post-deploy-fls-and-flexipage.mdc` GATE 2). For each blocked field:
+   retrieve the listed FlexiPage(s) from the org, remove ONLY the
+   `fieldInstance` entries for the IsDelete field(s) (`Record.<Field>__c`), and
+   deploy the page through `deploy.py` (dry-run, then `--start`). Change nothing
+   else on the page — no regeneration, no other field, section, or tab edits,
+   and no `actionOverrides` change. Confirm the page live, then re-run step 1.
+   Report per page which fields were unplaced.
 3. **Delete for real (DESTRUCTIVE):**
    ```
    python scripts/deploy.py --start \

@@ -100,6 +100,14 @@ wait for explicit selection, then proceed.
    `attr_drift.py` for definitions **including standard Name**. Deploy new
    fields only. Surface drift; never silently redeploy a type change (may be
    delete+recreate). Blank-API rows: label-fallback first.
+   **Labels are NOT covered by the name delta** — run both label syncs for
+   fields already in the org: §3c English (`Field Label (EN)` → org
+   translation) and §3d Japanese (`Field Label` → org `CustomField.label`,
+   `label_sync.py`). `prep_deploy.py` does both automatically.
+   See [deploy-delta-and-blockers.md](references/deploy-delta-and-blockers.md).
+   Lookup/MD `relationshipName`: existing field = org value; derive for new
+   fields only.
+   <!-- Updated by Divakar N — 2026-10-06. -->
 6. **Generate / manifest** — `generate_xml.py` then
    `build_manifest.py --only <Obj__c,...>` for incremental.
 7. **Check-only** then **real deploy** (`deploy.py --start` or
@@ -112,7 +120,8 @@ wait for explicit selection, then proceed.
 10. **Post-deploy gates** — Deployment Status (AI, incl. `Deleted`) → re-evaluate
     AH → auto-grant FLS on `SalesFrontAdmin` (re-check after requiredness flips)
     → FlexiPage only on first object create, when Tab/section is present
-    → org-default `actionOverrides`. Later sheet deploys do not modify that page.
+    → org-default `actionOverrides`. Later sheet deploys do not modify that page,
+    except to unplace an IsDelete field before deleting it.
     See [post-deploy-fls-and-flexipage.md](references/post-deploy-fls-and-flexipage.md).
 11. **New object tab** — if object was newly created and sheet **H6** = TRUE,
     create CustomTab, then **auto-grant tab visibility** `DefaultOn` on

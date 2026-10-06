@@ -15,7 +15,7 @@ Locate columns by **header name**. Full rules: [sheet-columns.md](../references/
 | L | 11 | Default Value (`デフォルト`) | Real default. Do not confuse with H. |
 | T | 19 | Precision (`精度`) | Metadata API `<precision>` only. Client does **not** fill this — derived from F for numeric types. Legacy T+U still accepted if F is blank. |
 | U | 20 | Scale (`スケール`) | Metadata API `<scale>` only. Same as T: do not ask the client to fill it. |
-| X | 23 | relationshipName | Lookup/MD relationship name (= field API minus `__c`). |
+| X | 23 | relationshipName | Lookup/MD relationship name. Existing field: the org's value. New field: field API minus `__c`. |
 | Y | 24 | deleteConstraint | Lookup delete: `SetNull` / `Restrict` / `Cascade`. Blank = generator default. |
 | Z | 25 | Tab | FlexiPage top-level tab. |
 | AA | 26 | section | FlexiPage section within a tab. |

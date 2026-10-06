@@ -10,6 +10,7 @@ from relname import (  # noqa: E402
     MAX_RELATIONSHIP_NAME,
     derive_relationship_name,
     is_standard_object,
+    org_relationship_name,
     qualify_relationship_name,
 )
 from numeric_size import apply_numeric_size, is_numeric_sheet_type  # noqa: E402
@@ -649,7 +650,19 @@ def build_field_xml(row: dict) -> ET.Element | None:
         ).strip()
         if rel_label:
             set_text(root, "relationshipLabel", rel_label)
-        if not rel_name:
+        # Updated by Divakar N — 2026-10-06. Why: an existing field keeps the
+        # org's child relationship name; only new fields are derived below.
+        org_rel = org_relationship_name(obj_api, field_api)
+        if org_rel:
+            if rel_name and rel_name != org_rel:
+                print(
+                    f"  ⚠️  {obj_api}.{field_api}: col X '{rel_name}' differs from "
+                    f"org relationshipName '{org_rel}' — emitting the org value"
+                )
+            rel_name = org_rel
+            row["Relationship Name"] = rel_name
+            row["_relname_from_org"] = rel_name
+        elif not rel_name:
             # col X blank: derive from the field API when col H has the lookup
             # object. Shared-parent names are object-scoped (see relname.py).
             if ref_to and field_api.endswith("__c"):
@@ -682,6 +695,7 @@ def build_field_xml(row: dict) -> ET.Element | None:
         # parent. Qualify with Logi/Fnt/Stc before emit.
         if (
             rel_name
+            and not org_rel
             and field_api.startswith("TI_Fnt_")
             and obj_api.startswith("TI_Logi_")
         ):

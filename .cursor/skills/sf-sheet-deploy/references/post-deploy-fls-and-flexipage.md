@@ -102,7 +102,15 @@ regenerate, redeploy, or otherwise modify the Lightning page. Leave the existing
 FlexiPage and its org-default `actionOverrides` exactly as they are. Sheet
 changes to Tab (Z), section (AA), or fields deployed in this update do not get
 pushed onto the page. Say so per object: Lightning page left unchanged because
-the object already existed.
+the object already existed. New fields added later are therefore not placed on
+the page automatically; someone adds them in App Builder if needed.
+
+<!-- Updated by Divakar N — 2026-10-06. -->
+**The ONE exception — unplacing a field marked for deletion.** If a field with
+IsDelete (AD) = TRUE is still placed on a Lightning page, remove only that
+field's `fieldInstance` from the page before deleting the field
+([deploy-delta-and-blockers.md](deploy-delta-and-blockers.md) STEP 2b §1b).
+Change nothing else on the page and do not touch `actionOverrides`.
 
 **Object is being created for the first time.** The CHECK is mandatory; the
 BUILD is conditional on page-layout placement info.
@@ -171,7 +179,8 @@ existed (page frozen), or the first-time create had no Tab/section info.
   silently.
 - Gate 2 BUILD runs only on a first-time object create, and only when
   Tab/section info exists. On every later object-definition sheet deploy the
-  Lightning page is frozen — do not modify it.
+  Lightning page is frozen — do not modify it, except to unplace a field that
+  is being deleted (IsDelete) before the delete.
 - GATE 2b (org-default `actionOverrides` on the CustomObject) is MANDATORY
   whenever this deploy built a FlexiPage — a deployed-but-unassigned page is a
   MISS. Never defer it to a manual App-Builder click. Do not rewrite

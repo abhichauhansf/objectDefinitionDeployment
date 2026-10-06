@@ -49,10 +49,16 @@ Scan for blockers including (non-exhaustive):
   (`設定値` / referenceTo) is also blank.** If col X is blank but col H has the
   lookup object, that is NOT a blocker:
   - field already in the org → write back the org's `relationshipName` to col X
-    (never invent a new child-relationship name on an existing field);
+    (never invent a new child-relationship name on an existing field). The org
+    value is read live (`readMetadata`) by `validate_sheet.py --target-org` and
+    used by `generate_xml.py`; a filled col X that differs from the org is a
+    WARN and the org value is kept. If the org cannot be read, blank X is an
+    ERROR — never fall back to deriving;
   - new field → auto-fill from the field API (minus `__c`; object-scoped for
     shared parents like User) via `relname.derive_relationship_name`, write it
-    back to col X, and proceed.
+    back to col X, and proceed. Shortening and Fnt/Logi qualifying apply to new
+    fields only.
+  <!-- Updated by Divakar N — 2026-10-06. -->
 - API names violating [field-api-naming.md](field-api-naming.md) /
   [field-namespace-prefix.md](field-namespace-prefix.md)
   (bad pattern, `> 40` chars, missing `__c`, wrong/duplicated prefix).
@@ -184,10 +190,27 @@ and deploy ONLY the new (and, if explicitly requested, changed) fields.
    explicit user approval. Drift is also enforced on the SOAP path
    (`mdapi_deploy.py` `_drift_gate()`); abort real deploy on unreviewed drift
    unless `--ack-drift`.
+3c. **TRANSLATION-LEVEL DRIFT (MANDATORY for fields present in BOTH).** The name
+   delta also does NOT prove the **English label** matches the sheet. A field
+   whose `Field Label (EN)` / `Translation Provenance` changed while its API name
+   stayed the same must still be packaged as `CustomObjectTranslation`
+   (`CHANGED_TRANSLATION`). `prep_deploy.py` prints this as a separate
+   TRANSLATIONS delta (new / changed / unchanged). Post-deploy `verify_deploy.py`
+   compares **every** in-scope sheet English value to the live org, so a later EN
+   edit cannot be reported as "complete" while the org still has the old label.
+3d. **JAPANESE LABEL DRIFT — THE SHEET OVERWRITES THE ORG (automatic).** The
+   sheet is the master for Japanese labels. For every existing object,
+   `prep_deploy.py` compares the sheet `Object Label`, `Name Field Label` and
+   each custom `Field Label` with the org (`readMetadata`, FLS-independent) and
+   packages every difference, printed as `LABELS (JA)`. `label_sync.py` builds
+   the relabel from the org's CURRENT definition with only `<label>` replaced, so
+   it never redeploys attribute drift (§3b stays a user decision).
+   `verify_deploy.py --plan` fails if a planned relabel did not land.
 4. **Report the delta before deploying:** e.g. "org already has N fields; sheet
    defines M; deploying the D new ones; X already present (skipped); Y org-only
-   (left untouched)." Keep the package limited to the delta so redeploys stay
-   fast and side-effect-free.
+   (left untouched)." **Also report translation new/changed.** Keep the schema
+   package limited to the field-name delta so redeploys stay fast; still include
+   every CHANGED/NEW English label in the translation package.
 5. Package + validate (check-only dry-run) the delta, then deploy for real with
    `deploy.py --start` (the ONLY flag that writes).
 6. **Log every on-the-go fix in TWO places — the value cell AND the AH note.**
@@ -219,6 +242,15 @@ package; `build_destructive.py` handles the actual deletion:
    `--target-org` verifies each field EXISTS in the org (Tooling API) — fields
    already absent are dropped as no-ops. It writes `manifest/destructiveChanges.xml`
    (CustomField members `<Obj>__c.<Field>__c`) + an empty `manifest/destructive_package.xml`.
+   With `--target-org` it also exits **2 (BLOCKED)** if a field to delete is
+   still placed on a Lightning page.
+1b. **Unplace from the Lightning page first (the ONE page-freeze exception).**
+   For each blocked field: retrieve the listed FlexiPage(s), remove ONLY the
+   `fieldInstance` entries for the IsDelete field(s) (`Record.<Field>__c`), and
+   deploy the page through `deploy.py` (dry-run, then `--start`). Change nothing
+   else on the page and do not touch `actionOverrides`. Confirm live, then
+   re-run step 1. See [post-deploy-fls-and-flexipage.md](post-deploy-fls-and-flexipage.md).
+   <!-- Updated by Divakar N — 2026-10-06. -->
 2. **Review** the printed delete set with the user — deletion is irreversible and
    also destroys the field's data.
 3. **Delete for real (DESTRUCTIVE):**

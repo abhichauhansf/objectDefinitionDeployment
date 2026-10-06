@@ -1,5 +1,5 @@
 ---
-description: MANDATORY post-deploy steps after ANY object/field deploy. (1) ALWAYS AUTO-GRANT Field-Level Security (FLS) for EVERY just-deployed field on the default permission set (SalesFrontAdmin) WITHOUT asking — newly deployed fields have NO FLS and are invisible until granted; read-only for formula/Summary/AutoNumber, Read+Edit for the rest;(2) Build + assign a FlexiPage from Tab (col Z) / section (col AA) ONLY when the object is created in the org for the first time. On later object-definition sheet deploys, do NOT modify that Lightning page.
+description: MANDATORY post-deploy steps after ANY object/field deploy. (1) ALWAYS AUTO-GRANT Field-Level Security (FLS) for EVERY just-deployed field on the default permission set (SalesFrontAdmin) WITHOUT asking — newly deployed fields have NO FLS and are invisible until granted; read-only for formula/Summary/AutoNumber, Read+Edit for the rest;(2) Build + assign a FlexiPage from Tab (col Z) / section (col AA) ONLY when the object is created in the org for the first time. On later object-definition sheet deploys, do NOT modify that Lightning page — the only exception is removing a field marked IsDelete from the page before deleting it.
 alwaysApply: true
 ---
 
@@ -151,7 +151,18 @@ regenerate, redeploy, or otherwise modify the Lightning page. Leave the existing
 FlexiPage and its org-default `actionOverrides` exactly as they are. Sheet
 changes to Tab (Z), section (AA), or fields deployed in this update do not get
 pushed onto the page. Say so per object: Lightning page left unchanged because
-the object already existed.
+the object already existed. New fields added later are therefore not placed on
+the page automatically; someone adds them in App Builder if needed.
+
+<!-- Updated by Divakar N — 2026-10-06. Why: Salesforce will not delete a field
+that a Lightning page still places, so an absolute freeze leaves IsDelete
+fields stuck. -->
+**The ONE exception — unplacing a field marked for deletion.** If a field with
+IsDelete (AD) = TRUE is still placed on a Lightning page, the page MUST be
+edited to remove that field before the field is deleted
+(`sf-deploy-delta-and-blockers.mdc` STEP 2b §1b). Remove only that field's
+`fieldInstance`; change nothing else on the page and do not touch
+`actionOverrides`. No other reason allows a page edit.
 
 **Object is being created for the first time.** The CHECK is mandatory; the
 BUILD is conditional on page-layout placement info.
@@ -243,7 +254,8 @@ existed (page frozen), or the first-time create had no Tab/section info.
   object with `ObjectPermissions = NONE` is a MISS.
 - Gate 2 BUILD runs only on a first-time object create, and only when
   Tab/section info exists. On every later object-definition sheet deploy the
-  Lightning page is frozen — do not modify it.
+  Lightning page is frozen — do not modify it, except to unplace a field that
+  is being deleted (IsDelete) before the delete.
 - GATE 2b (org-default `actionOverrides` on the CustomObject) is MANDATORY
   whenever this deploy built a FlexiPage — a deployed-but-unassigned page is a
   MISS. Never defer it to a manual App-Builder click. Do not rewrite

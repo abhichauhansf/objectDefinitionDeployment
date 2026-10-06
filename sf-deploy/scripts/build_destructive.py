@@ -236,7 +236,9 @@ def main() -> int:
         print("     (Salesforce rejects the whole delete set until they are removed):")
         for key, pages in blocked.items():
             print(f"     {key}  ->  {', '.join(pages)}")
-        print("  Remove the field(s) from the page, deploy the FlexiPage, then re-run.")
+        print("  Remove ONLY these field(s) from the page, deploy the FlexiPage, then")
+        print("  re-run. This is the one allowed edit to a frozen page — change nothing")
+        print("  else on it (sf-deploy-delta-and-blockers.mdc STEP 2b §1b).")
         print("=" * 72)
         return 2
 

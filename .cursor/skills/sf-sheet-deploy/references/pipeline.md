@@ -175,9 +175,12 @@ which strategy to use. This is the standing default (decided 2026-08-10):
    later refinement. Highlight updated formula rows green (Column A only).
 4. **Wire relationships** — for Lookup/MasterDetail, col H (`設定値`) is the
    lookup object (`referenceTo`). If col X (`relationshipName`) is blank, check
-   col H: a populated lookup object means auto-fill X from the field API minus
-   `__c` (object-scoped for shared parents User/Account/…). Only blank X **and**
-   blank H is a blocker. Write the derived name back to col X (gated).
+   the org first: an existing field keeps the org's relationshipName (write it
+   back to col X, gated). Only for a NEW field, a populated lookup object means
+   auto-fill X from the field API minus `__c` (object-scoped for shared parents
+   User/Account/…). Only blank X **and** blank H is a blocker. Write the name
+   back with `fill_relationship_name.py --target-org <ORG>` (gated).
+   <!-- Updated by Divakar N — 2026-10-06. -->
 5. **Resolve or park cross-object lookups** — see next section.
 6. **Re-validate to 0 ERRORs → generate → build manifest → check-only dry-run →
    real deploy → append the post-deploy report tab.** If the object does

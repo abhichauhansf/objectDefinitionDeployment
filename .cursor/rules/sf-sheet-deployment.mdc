@@ -169,11 +169,15 @@ which strategy to use. This is the standing default (decided 2026-08-10):
    G is an object API name (`User`, `Foo__c`). H wins when both are filled.
    Write a G-sourced object API back to col H (gated). Japanese prose in G
    is not a target and is not copied into H.
-   If col X (`relationshipName`) is blank, check that lookup object: a
-   populated one means auto-fill X from the field API minus `__c`
-   (object-scoped for shared parents User/Account/…). Only blank X **and**
-   blank H **and** blank G is a blocker. Write the derived name back to col X
-   (gated).
+   If col X (`relationshipName`) is blank, check the org first: a field that
+   already exists keeps the org's relationshipName (write that back to col X,
+   gated). Only for a NEW field, auto-fill X from the field API minus `__c`
+   (object-scoped for shared parents User/Account/…) when the lookup object is
+   known. Only blank X **and** blank H **and** blank G is a blocker. Write the
+   derived name back to col X (gated). Use
+   `fill_relationship_name.py --target-org <ORG>` for the write-back.
+   <!-- Updated by Divakar N — 2026-10-06. Why: do not invent child
+        relationship names for fields already in the org. -->
 5. **Resolve or park cross-object lookups** — see next section.
 6. **Re-validate to 0 ERRORs → generate → build manifest → check-only dry-run →
    real deploy (`deploy.py --start`) → append the post-deploy report tab.** If the object does

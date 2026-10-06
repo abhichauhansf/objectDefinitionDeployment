@@ -11,10 +11,20 @@ User/Account/… do not collide.
 Used by validate_sheet.py (in-memory auto-fill, not an ERROR when H is set),
 generate_xml.py (emit the derived name), and fill_relationship_name.py
 (sheet write-back).
+
+Updated by Divakar N — 2026-10-06: a field that already exists in the org keeps
+the org's relationshipName (read via readMetadata, FLS-independent). Deriving,
+shortening, and Fnt/Logi qualifying apply to NEW fields only. Renaming a child
+relationship on an existing field can fail the deploy or break references.
 """
 from __future__ import annotations
 
 import json
+import re
+import subprocess
+import urllib.error
+import urllib.request
+import xml.etree.ElementTree as ET
 from pathlib import Path
 
 # Salesforce CustomField.relationshipName max length (Metadata API).
@@ -99,6 +109,92 @@ def _obj_acronym(obj_api: str) -> str:
 
 
 TAKEN_CACHE = Path(".build/relname_taken.json")
+ORG_RELNAME_CACHE = Path(".build/relname_org.json")
+RELATIONSHIP_TYPES = frozenset({"Lookup", "MasterDetail", "Hierarchy"})
+
+
+def _read_object_relationship_names(obj_api: str, tok: str, inst: str,
+                                    ver: str) -> dict[str, str] | None:
+    """readMetadata(CustomObject) -> {fieldFullName: relationshipName} for
+    relationship fields. None when the object is absent in the org."""
+    soap = (
+        '<soapenv:Envelope xmlns:soapenv="http://schemas.xmlsoap.org/soap/envelope/" '
+        'xmlns:met="http://soap.sforce.com/2006/04/metadata"><soapenv:Header>'
+        f'<met:SessionHeader><met:sessionId>{tok}</met:sessionId></met:SessionHeader>'
+        '</soapenv:Header><soapenv:Body><met:readMetadata><met:type>CustomObject</met:type>'
+        f'<met:fullNames>{obj_api}</met:fullNames></met:readMetadata></soapenv:Body>'
+        '</soapenv:Envelope>'
+    )
+    req = urllib.request.Request(
+        f"{inst}/services/Soap/m/{ver}", data=soap.encode(),
+        headers={"Content-Type": "text/xml; charset=UTF-8", "SOAPAction": '""'})
+    xml = urllib.request.urlopen(req, timeout=120).read().decode()
+    xml = re.sub(r'\sxmlns(:\w+)?="[^"]*"', '', xml)
+    xml = re.sub(r'<(/?)\w+:', r'<\1', xml)
+    xml = re.sub(r'\s\w+:(\w+=)', r' \1', xml)
+    rec = ET.fromstring(xml).find(".//records")
+    if rec is None or rec.find("fullName") is None:
+        return None
+    out: dict[str, str] = {}
+    for f in rec.findall("fields"):
+        if (f.findtext("type") or "").strip() not in RELATIONSHIP_TYPES:
+            continue
+        name = (f.findtext("fullName") or "").strip()
+        if name:
+            out[name] = (f.findtext("relationshipName") or "").strip()
+    return out
+
+
+def fetch_org_relationship_names(target_org: str, objects: set[str],
+                                 token_file: str = ".build/orgauth.json"
+                                 ) -> dict[str, dict[str, str]] | None:
+    """Live org relationshipName per existing relationship field.
+
+    Returns {obj: {field: relationshipName}} (absent objects map to {}), or
+    None when the org could not be read.
+    """
+    cp = subprocess.run(
+        ["python3", "scripts/get_token.py", "--alias", target_org, "--out", token_file],
+        text=True, capture_output=True)
+    if cp.returncode != 0:
+        print(f"⚠️  relationshipName org read skipped (get_token failed: "
+              f"{(cp.stderr or cp.stdout)[:200]})")
+        return None
+    try:
+        a = json.load(open(token_file, encoding="utf-8"))["result"]
+        tok, inst, ver = a["accessToken"], a["instanceUrl"].rstrip("/"), a["apiVersion"]
+    except (OSError, ValueError, KeyError) as e:
+        print(f"⚠️  relationshipName org read skipped (token file: {e})")
+        return None
+    out: dict[str, dict[str, str]] = {}
+    for obj in sorted(o for o in objects if o):
+        try:
+            out[obj] = _read_object_relationship_names(obj, tok, inst, ver) or {}
+        except (urllib.error.URLError, ET.ParseError, OSError) as e:
+            print(f"⚠️  relationshipName org read failed for {obj} ({e})")
+            return None
+    return out
+
+
+def save_org_relationship_names(org: str, rels: dict[str, dict[str, str]]) -> None:
+    ORG_RELNAME_CACHE.parent.mkdir(exist_ok=True)
+    json.dump({"org": org, "objects": rels},
+              open(ORG_RELNAME_CACHE, "w", encoding="utf-8"),
+              ensure_ascii=False, indent=1)
+
+
+def org_relationship_name(obj_api: str, field_api: str) -> str | None:
+    """Org relationshipName for an EXISTING field, else None (new field, or the
+    org was not read this run)."""
+    try:
+        cache = json.load(open(ORG_RELNAME_CACHE, encoding="utf-8"))
+    except (OSError, ValueError):
+        return None
+    fields = (cache.get("objects") or {}).get(obj_api) or {}
+    for name, rel in fields.items():
+        if name.lower() == (field_api or "").lower():
+            return rel or None
+    return None
 
 
 def bare_relationship_name(name: str) -> str:

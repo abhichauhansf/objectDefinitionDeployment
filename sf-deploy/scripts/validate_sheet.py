@@ -12,7 +12,9 @@ DATADICTIONARY_VALIDATION.md, GOOGLE_SHEET_STRUCTURE.md):
   - Semicolon `;` is the picklist value delimiter.
   - Checkbox: defaultValue (TRUE/FALSE) required.
   - MultiselectPicklist: visibleLines required.
-  - Lookup/MasterDetail: relationshipName (col X) is auto-filled from the field
+  - Lookup/MasterDetail: a field already in the org keeps the org's
+    relationshipName (Divakar N, 2026-10-06; read live with --target-org).
+    For a NEW field, relationshipName (col X) is auto-filled from the field
     API when col X is blank AND the lookup object is known. The lookup object
     is col H (設定値). Updated by Divakar N — 2026-10-05: when H is blank, col G
     (データ型に応じて… / referenceTo) is used instead. Only blank-X PLUS blank
@@ -46,11 +48,15 @@ from pathlib import Path
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 from relname import (  # noqa: E402
     MAX_RELATIONSHIP_NAME,
+    ORG_RELNAME_CACHE,
     TAKEN_CACHE,
     bare_relationship_name,
     derive_relationship_name,
+    fetch_org_relationship_names,
     is_standard_object,
+    org_relationship_name,
     qualify_relationship_name,
+    save_org_relationship_names,
     save_taken,
 )
 from rollup_h import apply_rollup_h  # noqa: E402  # Updated by Divakar N — 2026-09-23
@@ -200,6 +206,7 @@ def validate(
     rep: Report,
     org_objects: set[str] | None = None,
     org_child_rels: dict[str, list[dict]] | None = None,
+    org_relnames_failed: bool = False,
 ) -> None:
     # object set present in this deploy (for dependency hints)
     deploy_objects = {r.get("Object API Name", "").strip()
@@ -306,14 +313,38 @@ def validate(
         apply_lookup_ref_from_g(r)
         ref_col = "col G" if r.get("_referenceToSource") == "G" else "col H"
 
+        # ---- existing field: the org owns relationshipName --------------- #
+        # Updated by Divakar N — 2026-10-06. Why: inventing col X for a field
+        # already in the org can fail the deploy or rename a child
+        # relationship other code depends on.
+        org_reln = (org_relationship_name(obj, fapi)
+                    if sf_type in ("Lookup", "MasterDetail", "Hierarchy") else None)
+        if org_reln:
+            sheet_reln = str(r.get("Relationship Name") or "").strip()
+            if not sheet_reln:
+                rep.info(obj, loc, "relationshipname.org",
+                         f"col X blank; field exists in org → using org "
+                         f"relationshipName='{org_reln}' (write back to col X)")
+            elif sheet_reln != org_reln:
+                rep.warn(obj, loc, "relationshipname.org",
+                         f"col X '{sheet_reln}' differs from org relationshipName "
+                         f"'{org_reln}' — keeping the org value (write back to col X)")
+            r["Relationship Name"] = org_reln
+            r["_relname_from_org"] = org_reln
+
         # ---- blank col X: auto-fill from the lookup object --------------- #
+        # NEW fields only (existing fields were resolved from the org above).
         # If relationshipName is blank but H (or G, when H is blank) has a
         # valid referenceTo, derive X from the field API (object-scoped for
         # shared parents). This is NOT a blocker. Blank X + blank H + blank G
         # remains an ERROR (caught in the ref block below).
         if sf_type in ("Lookup", "MasterDetail", "Hierarchy") and not nonblank(r.get("Relationship Name")):
             href = str(r.get(G) or r.get("Reference To") or "").strip()
-            if href and fapi.endswith("__c"):
+            if org_relnames_failed and fapi.endswith("__c"):
+                rep.error(obj, loc, "relationshipname.org",
+                          "col X blank and the org's relationshipName could not be "
+                          "read — not deriving one (the field may already exist)")
+            elif href and fapi.endswith("__c"):
                 derived = derive_relationship_name(fapi, obj, href)
                 if derived:
                     r["Relationship Name"] = derived
@@ -578,6 +609,7 @@ def validate(
             reln = str(r.get("Relationship Name") or "").strip()
             if (
                 reln
+                and not r.get("_relname_from_org")
                 and fapi.startswith("TI_Fnt_")
                 and obj.startswith("TI_Logi_")
             ):
@@ -837,7 +869,17 @@ def main() -> int:
 
     org_objects = None
     org_child_rels = None
+    org_relnames_failed = False
+    ORG_RELNAME_CACHE.unlink(missing_ok=True)
     if args.target_org:
+        own_objects = {str(r.get("Object API Name") or "").strip() for r in rows}
+        print(f"🔎 reading org relationshipName for existing fields on "
+              f"{len(own_objects)} object(s)…")
+        org_rels = fetch_org_relationship_names(args.target_org, own_objects)
+        if org_rels is None:
+            org_relnames_failed = True
+        else:
+            save_org_relationship_names(args.target_org, org_rels)
         refs = collect_reference_targets(rows)
         if refs:
             print(f"🔎 checking {len(refs)} distinct referenceTo target(s) live "
@@ -851,7 +893,8 @@ def main() -> int:
         TAKEN_CACHE.unlink(missing_ok=True)
 
     rep = Report()
-    validate(rows, rep, org_objects=org_objects, org_child_rels=org_child_rels)
+    validate(rows, rep, org_objects=org_objects, org_child_rels=org_child_rels,
+             org_relnames_failed=org_relnames_failed)
     print_log(rep, len(rows))
 
     if args.json_out:

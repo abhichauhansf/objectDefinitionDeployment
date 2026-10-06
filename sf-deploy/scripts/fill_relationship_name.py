@@ -14,8 +14,12 @@ name is OBJECT-SCOPED with a short acronym of the owning object
 (e.g. ExportControlClassification → 'ECC_SalesDeliveryInCharge'). Only rows that
 are Lookup/MD with a currently-empty relationshipName are touched.
 
-  python scripts/fill_relationship_name.py --spreadsheet-id <ID> \
-      --tab "成約:Sales_Deal" [--apply]
+Updated by Divakar N — 2026-10-06: with --target-org, a field that already
+exists in the org gets the org's relationshipName written back instead of a
+derived one. Deriving applies to new fields only.
+
+  python scripts/fill_relationship_name.py --tab "成約:Sales_Deal" \
+      --target-org <ORG> [--apply]
 """
 from __future__ import annotations
 
@@ -25,7 +29,7 @@ import sys
 
 sys.path.insert(0, "scripts")
 from fetch_sheet import find_header_row, norm  # noqa: E402
-from relname import derive_relationship_name  # noqa: E402
+from relname import derive_relationship_name, fetch_org_relationship_names  # noqa: E402
 from write_back import get_write_service  # noqa: E402
 from sheet_config import add_spreadsheet_id_arg  # noqa: E402
 
@@ -49,12 +53,25 @@ def main() -> int:
     add_spreadsheet_id_arg(ap)
     ap.add_argument("--tab", required=True)
     ap.add_argument("--temp", default="temp_updates.json")
+    ap.add_argument("--target-org", default="",
+                    help="read relationshipName of fields already in this org")
     ap.add_argument("--apply", action="store_true")
     args = ap.parse_args()
 
     tu = json.load(open(args.temp, encoding="utf-8"))
     obj_api = next((r.get("Object API Name", "") for r in tu
                     if r.get("_type") == "object_meta"), "")
+    org_rels: dict[str, str] = {}
+    if args.target_org:
+        fetched = fetch_org_relationship_names(args.target_org, {obj_api})
+        if fetched is None:
+            print("❌ could not read relationshipName from the org — refusing to "
+                  "derive names for fields that may already exist.")
+            return 1
+        org_rels = {k.lower(): v for k, v in (fetched.get(obj_api) or {}).items() if v}
+    else:
+        print("⚠️  no --target-org: names are derived for every row. Pass "
+              "--target-org so existing fields get the org value.")
     # Custom lookups only — never touch standard fields (OwnerId, CreatedById…).
     lk = {r.get("Field API Name") for r in tu
           if r.get("_type") != "object_meta"
@@ -80,19 +97,24 @@ def main() -> int:
         api = cells[dcol] if dcol < len(cells) else ""
         cur = cells[rncol] if rncol < len(cells) else ""
         if api in lk and not cur:
-            targets.append((i + 1, api, rel_name(api, obj_api, parent_of.get(api, ""))))
+            org_rn = org_rels.get(api.lower())
+            if org_rn:
+                targets.append((i + 1, api, org_rn, "org"))
+            else:
+                targets.append((i + 1, api,
+                                rel_name(api, obj_api, parent_of.get(api, "")), "derived"))
 
     print(f"tab: {args.tab} | relationshipName col: {rncol_letter}")
     print(f"lookup/MD rows to fill ({len(targets)}):")
-    for r, api, rn in targets:
-        print(f"  row {r:>3} | {api:<34} -> {rn}")
+    for r, api, rn, src in targets:
+        print(f"  row {r:>3} | {api:<34} -> {rn}  ({src})")
 
     if not args.apply:
         print("DRY RUN — nothing written. Re-run with --apply.")
         return 0
 
     data = [{"range": f"'{args.tab}'!{rncol_letter}{r}", "values": [[rn]]}
-            for r, _, rn in targets]
+            for r, _, rn, _src in targets]
     resp = svc.spreadsheets().values().batchUpdate(
         spreadsheetId=args.spreadsheet_id,
         body={"valueInputOption": "RAW", "data": data}).execute()
