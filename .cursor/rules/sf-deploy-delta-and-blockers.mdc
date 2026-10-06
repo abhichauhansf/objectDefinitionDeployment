@@ -274,6 +274,8 @@ package; `build_destructive.py` handles the actual deletion:
    else on the page — no regeneration, no other field, section, or tab edits,
    and no `actionOverrides` change. Confirm the page live, then re-run step 1.
    Report per page which fields were unplaced.
+2. **Review** the printed delete set with the user — deletion is irreversible and
+   also destroys the field's data.
 3. **Delete for real (DESTRUCTIVE):**
    ```
    python scripts/deploy.py --start \
