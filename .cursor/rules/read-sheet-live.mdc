@@ -48,7 +48,9 @@ file. See `.cursor/rules/sf-default-google-sheet.mdc`.
 
 ## Guardrails
 
-- If a live fetch fails (auth/permission/network), STOP and report it — do not
-  silently fall back to a cached file.
+- If a live fetch fails because the Google login expired, re-authenticate per
+  `google-sheet-auth.mdc` (`python scripts/google_auth.py`) and retry the fetch.
+- If a live fetch still fails (auth/permission/network), STOP and report it — do
+  not silently fall back to a cached file.
 - Never present cached data as if it were current. If you cannot fetch live,
   say so explicitly rather than answering from a stale snapshot.

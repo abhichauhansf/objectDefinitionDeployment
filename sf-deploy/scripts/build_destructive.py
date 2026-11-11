@@ -34,6 +34,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import re
 import subprocess
 import sys
 import tempfile
@@ -46,7 +47,7 @@ from fetch_sheet import (  # noqa: E402
 )
 from sheet_config import add_spreadsheet_id_arg  # noqa: E402
 
-API_NAME_OK = __import__("re").compile(r"^[A-Za-z][A-Za-z0-9_]*__c$")
+API_NAME_OK = re.compile(r"^[A-Za-z][A-Za-z0-9_]*__c$")
 
 
 def scan_delete_rows(svc, sid: str, tabs: list[str]) -> list[dict]:
@@ -142,27 +143,66 @@ def flexipage_refs(target_org: str, deletes: list[dict]) -> dict[str, list[str]]
     if not pages:
         return refs
     with tempfile.TemporaryDirectory() as td:
+        # sf treats `--metadata FlexiPage:a,FlexiPage:b` as ONE name
+        # (`FlexiPage:a,FlexiPage:b`), so a comma-joined retrieve returns
+        # nothing and we used to false-BLOCK the whole delete set. Use a
+        # package.xml (batched — 281 pages in one retrieve is slow/fragile).
+        tdp = Path(td)
         try:
-            subprocess.run(
-                ["sf", "project", "retrieve", "start", "--metadata",
-                 ",".join(f"FlexiPage:{p}" for p in pages),
-                 "--target-org", target_org, "--target-metadata-dir", td,
-                 "--unzip", "--json"],
-                capture_output=True, text=True, timeout=600)
+            batch_size = 40
+            for i in range(0, len(pages), batch_size):
+                chunk = pages[i:i + batch_size]
+                members = "\n".join(f"        <members>{p}</members>" for p in chunk)
+                pkg = tdp / f"package_{i}.xml"
+                pkg.write_text(
+                    '<?xml version="1.0" encoding="UTF-8"?>\n'
+                    '<Package xmlns="http://soap.sforce.com/2006/04/metadata">\n'
+                    '    <types>\n'
+                    f"{members}\n"
+                    '        <name>FlexiPage</name>\n'
+                    '    </types>\n'
+                    '    <version>66.0</version>\n'
+                    '</Package>\n',
+                    encoding="utf-8",
+                )
+                dest = tdp / f"out_{i}"
+                dest.mkdir(parents=True, exist_ok=True)
+                subprocess.run(
+                    ["sf", "project", "retrieve", "start",
+                     "--manifest", str(pkg),
+                     "--target-org", target_org,
+                     "--target-metadata-dir", str(dest),
+                     "--unzip", "--json"],
+                    capture_output=True, text=True, timeout=600,
+                    check=False,
+                )
         except Exception as e:
             print(f"  ⚠️  FlexiPage retrieve skipped ({e}).")
             return refs
         bodies = {p.name: p.read_text(encoding="utf-8", errors="replace")
-                  for p in Path(td).rglob("*.flexipage*")}
+                  for p in tdp.rglob("*.flexipage*")}
     if not bodies:
         print(f"  ⚠️  FlexiPage retrieve returned no page files for {len(pages)} page(s) "
               "— cannot rule out page references; treating as BLOCKED.")
         return {f"{d['object']}.{d['field']}": ["<unverified: retrieve empty>"]
                 for d in deletes}
+    def _page_sobject(body: str) -> str:
+        m = re.search(r"<sobjectType>([^<]+)</sobjectType>", body)
+        return m.group(1).strip() if m else ""
+
     for d in deletes:
         key = f"{d['object']}.{d['field']}"
-        hits = [name for name, body in bodies.items()
-                if f"Record.{d['field']}" in body]
+        needle = f"Record.{d['field']}"
+        hits = []
+        for name, body in bodies.items():
+            if needle not in body:
+                continue
+            sobj = _page_sobject(body)
+            # Same API name on a DIFFERENT object (e.g. SIE.InternalReservationNo
+            # vs InternalReservation.InternalReservationNo) is not a blocker.
+            if sobj and sobj != d["object"]:
+                continue
+            hits.append(name)
         if hits:
             refs[key] = hits
     return refs

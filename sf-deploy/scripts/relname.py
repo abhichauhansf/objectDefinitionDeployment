@@ -3,8 +3,7 @@
 
 Salesforce requires <relationshipName> on every relationship field. When the
 sheet's col X is blank, we still have the lookup target in col H (設定値 /
-referenceTo). Updated by Divakar N — 2026-10-05: when H is blank, col G is
-that target. Derive X from the field API (minus __c), object-scoping the
+referenceTo); col G is never read (Divakar N, 2026-10-08). Derive X from the field API (minus __c), object-scoping the
 name when the parent is a shared standard object so two children looking up
 User/Account/… do not collide.
 

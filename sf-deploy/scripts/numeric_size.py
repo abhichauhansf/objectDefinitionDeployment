@@ -82,8 +82,9 @@ def check_bounds(precision: int, scale: int) -> str | None:
         return f"precision ({precision} = integer digits + scale) must be 1–18"
     if not (0 <= scale <= 17):
         return f"scale ({scale}) must be 0–17"
-    if scale > precision:
-        return f"scale ({scale}) must be <= precision ({precision})"
+    if scale >= precision:
+        return (f"scale ({scale}) must be < precision ({precision}) — Salesforce "
+                f"needs at least 1 integer digit (col F '0, {scale}' → write '1, {scale}')")
     return None
 
 

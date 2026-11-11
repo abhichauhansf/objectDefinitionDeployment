@@ -152,7 +152,8 @@ def build_section(parent_region: ET.Element, facets: list, used_ids: set,
     want = desired_cols if len(fields) > 1 else 1
     ncols = max(want, cap_cols)
     chunk = -(-len(fields) // ncols)
-    col_chunks = [fields[i:i + chunk] for i in range(0, len(fields), chunk)] or [[]]
+    # Z-shape (row-major): left col = items 1,3,5; right col = 2,4,6 (client request)
+    col_chunks = [fields[c::ncols] for c in range(ncols)] if fields else [[]]
 
     inst = ET.SubElement(parent_region, qn("itemInstances"))
     comp = ET.SubElement(inst, qn("componentInstance"))
@@ -247,6 +248,19 @@ def build(page_dev: str, master_label: str, sobject: str,
     return root
 
 
+def has_record_types(org: str, sobject: str) -> bool:
+    import subprocess
+    cp = subprocess.run(
+        ["sf", "data", "query", "--target-org", org, "--json", "--query",
+         f"SELECT COUNT() FROM RecordType WHERE SobjectType='{sobject}'"],
+        capture_output=True, text=True, timeout=120)
+    try:
+        return int(json.loads(cp.stdout)["result"]["totalSize"]) > 0
+    except (ValueError, KeyError, TypeError):
+        print(f"  ⚠️  record-type check failed for {sobject} — RecordTypeId dropped")
+        return False
+
+
 def main() -> int:
     ap = argparse.ArgumentParser()
     ap.add_argument("--tabs-json", default=".build/deal_tabs.json")
@@ -257,7 +271,13 @@ def main() -> int:
     ap.add_argument("--cols", type=int, default=2)
     ap.add_argument("--tab-order", default="",
                     help="comma-separated tab labels to force ordering")
+    ap.add_argument("--org", default="",
+                    help="org alias; RecordTypeId is placed only if the object has record types there")
     args = ap.parse_args()
+
+    # Record.RecordTypeId fails deploy on an object with no record types
+    # ("couldn't retrieve … Record.RecordTypeId", ERPPJ-1097).
+    keep_rt = bool(args.org) and has_record_types(args.org, args.sobject)
 
     raw = json.load(open(args.tabs_json, encoding="utf-8"))
     tabs: "OrderedDict[str, OrderedDict[str, list]]" = OrderedDict()
@@ -270,6 +290,10 @@ def main() -> int:
             for f in fields:
                 f = STANDARD_ALIASES.get(f, f)
                 if f in FLEXIPAGE_NOT_PLACEABLE:
+                    continue
+                if f == "RecordTypeId" and not keep_rt:
+                    print("  ⚠️  RecordTypeId dropped — object has no record types in the org"
+                          + ("" if args.org else " (pass --org to check)"))
                     continue
                 if not f.endswith("__c") and f not in STANDARD_PLACEABLE:
                     print(f"  ⚠️  standard field '{f}' is not placeable on a "

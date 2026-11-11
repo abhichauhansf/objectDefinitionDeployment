@@ -31,6 +31,7 @@ from pathlib import Path
 
 TRAILING_NUM_RE = re.compile(r"([0-9０-９]+)$")
 ASCII_RUN_RE = re.compile(r"[A-Za-z][A-Za-z0-9]*")
+FORMULA_HOP_RE = re.compile(r"(?<![\w.])([A-Za-z][A-Za-z0-9_]*?)__r\.")
 
 # structural tokens that may not be their own glossary row
 FALLBACK = {
@@ -164,6 +165,13 @@ def main() -> int:
     obj = next((r for r in fields if r.get("_type") == "object_meta"), {})
     obj_api = norm(obj.get("Object API Name"))
 
+    # Updated by Divakar N — 2026-10-12. Why: formulas written as
+    # TI_Fnt_SDS__r.<field> need the lookup itself to be TI_Fnt_SDS__c; the
+    # glossary named it from its label and the deploy failed.
+    hops = {h.lower(): h for r in fields if r.get("_type") != "object_meta"
+            and norm(r.get("Data Type")).lower().startswith("formula")
+            for h in FORMULA_HOP_RE.findall(norm(r.get("Type Specific Value")))}
+
     out_rows = []
     for r in fields:
         if r.get("_type") == "object_meta":
@@ -177,6 +185,16 @@ def main() -> int:
                 "label": label, "type": norm(r.get("Data Type")),
                 "existing": existing, "proposed": existing,
                 "method": "existing", "conf": "—", "unmatched": "", "notes": "already named",
+            })
+            continue
+        ref = norm(r.get("Type Specific Value"))
+        hop = hops.get(ref[:-3].lower()) if ref.lower().endswith("__c") else None
+        if norm(r.get("Data Type")) in ("Lookup", "MasterDetail") and hop:
+            out_rows.append({
+                "label": label, "type": norm(r.get("Data Type")),
+                "existing": "", "proposed": re.sub(r"^TI_Fnt_", "", hop),
+                "method": "formula-path", "conf": "High", "unmatched": "",
+                "notes": f"named so formulas' {hop}__r. resolves",
             })
             continue
         p = propose(label, terms_sorted, g)

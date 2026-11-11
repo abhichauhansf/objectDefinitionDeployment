@@ -150,6 +150,9 @@ def main() -> int:
                          "field/object/tab permissions than the org (full replace removes them)")
     ap.add_argument("--dry-run", action="store_true", help="print the sf command, do not run")
     args = ap.parse_args()
+    if not args.list_orgs:
+        from run_lock import acquire
+        acquire("deploy.py")
 
     cli = sf_available()
     if not cli:

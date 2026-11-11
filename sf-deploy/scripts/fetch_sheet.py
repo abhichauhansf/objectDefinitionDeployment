@@ -5,10 +5,11 @@ from a Google Sheet into `temp_updates.json` (the exact shape the existing
 `generate_xml.py` generator expects).
 
 Replaces the CI-only inline `fetch_data.js`. Runs fully locally using the
-user's Google credentials:
-  1. Application Default Credentials (ADC)  — `gcloud auth application-default
-     login --scopes=...spreadsheets,drive`  (preferred, deploys as the user), OR
-  2. a service-account JSON via GOOGLE_SERVICE_ACCOUNT_JSON.
+user's Google credentials via `google_auth.py`:
+  1. a service-account JSON via GOOGLE_SERVICE_ACCOUNT_JSON, OR
+  2. Application Default Credentials. If they are missing or expired,
+     google_auth.py runs `gcloud auth login --enable-gdrive-access --update-adc`
+     (browser sign-in) and continues.
 
 Usage:
   python scripts/fetch_sheet.py \
@@ -160,60 +161,74 @@ def find_helper_cols(header_row: list) -> dict:
 
 
 def get_sheets_service():
-    """Build a Sheets API client from ADC or a service-account JSON."""
-    from googleapiclient.discovery import build
+    """Read-only Sheets client; re-runs the gcloud login if credentials expired."""
+    from google_auth import sheets_service
 
-    scopes = [
-        "https://www.googleapis.com/auth/spreadsheets.readonly",
-        "https://www.googleapis.com/auth/drive.readonly",
-    ]
-    sa_raw = os.environ.get("GOOGLE_SERVICE_ACCOUNT_JSON", "").strip()
-    if sa_raw:
-        import base64
-        from google.oauth2 import service_account
-
-        if sa_raw.startswith("{"):
-            info = json.loads(sa_raw)
-        elif sa_raw.startswith("/") or sa_raw.lower().endswith(".json"):
-            info = json.load(open(sa_raw))
-        else:
-            info = json.loads(base64.b64decode(sa_raw).decode())
-        creds = service_account.Credentials.from_service_account_info(info, scopes=scopes)
-    else:
-        import google.auth
-
-        creds, _ = google.auth.default(scopes=scopes)
-    return build("sheets", "v4", credentials=creds, cache_discovery=False)
+    return sheets_service()
 
 
 def norm(s) -> str:
     return str(s or "").strip()
 
 
-def apply_lookup_ref_from_g(rec: dict) -> bool:
-    """Lookup / Master-Detail: blank col H (設定値) falls back to col G.
+_PICKLIST_TYPES = {
+    "picklist", "multiselectpicklist", "multipicklist", "選択リスト", "選択リスト(複数選択)",
+}
 
-    Updated by Divakar N — 2026-10-05.
-    Why: the client sometimes leaves the lookup object only in col G
-    (データ型に応じて… / referenceTo). Column H stays the value when it is
-    filled. Formula, picklist, and roll-up rows never read G.
 
-    Returns True when referenceTo was copied from G into Type Specific Value.
+# Updated by Divakar N — 2026-10-19. Why: the client writes
+# "グローバル選択リスト：承認ステータス" in col H to mean "use the global value set";
+# it was parsed as one inline value. Map the set's label to its DeveloperName.
+GVS_REF_PREFIX = "グローバル選択リスト"
+GVS_BY_LABEL = {
+    "承認ステータス": "ApprovalStatus",
+}
+_GVS_API_RE = re.compile(r"^[A-Za-z][A-Za-z0-9_]*$")
+
+
+def apply_global_value_set_ref(rec: dict) -> bool:
+    """Col H ``グローバル選択リスト：<label>`` → ``Global Value Set`` = DeveloperName.
+
+    An unknown label is kept in ``_gvsUnresolved`` so the validator can block it.
+    Returns True when H was a global-value-set reference.
+    """
+    h = norm(rec.get(COL_H_KEY))
+    if not h.startswith(GVS_REF_PREFIX):
+        return False
+    ref = h[len(GVS_REF_PREFIX):].lstrip("：: \u3000").strip()
+    name = GVS_BY_LABEL.get(ref) or (ref if _GVS_API_RE.match(ref) else "")
+    rec[COL_H_KEY] = ""
+    if name:
+        rec["Global Value Set"] = name
+    else:
+        rec["_gvsUnresolved"] = ref
+    return True
+
+
+def apply_picklist_values_from_g(rec: dict) -> bool:
+    """Picklist: col H (``value``) holds the values; blank H falls back to col G.
+
+    Updated by Divakar N — 2026-10-08.
+    Why: agreed with Yagai-san. Col H (header renamed ``value``) carries the
+    deployable ``Label:ApiName;`` list and col L is the default value. Col G is
+    the customer view (labels only). When H is filled it is used as-is and G is
+    ignored. When H is blank, the labels are read from G; ``picklist_api.py``
+    generates the English API names and the result is written to col H (gated),
+    so H is always the source after the first deploy.
+
+    Returns True when the values were taken from G.
     """
     raw = norm(rec.get("Data Type")).lower().replace(" ", "").replace("_", "").replace("-", "")
-    if raw not in _LOOKUP_REF_TYPES:
+    if raw not in _PICKLIST_TYPES:
         return False
-    if norm(rec.get(COL_H_KEY)):
+    rec["_picklistSource"] = "H"
+    if apply_global_value_set_ref(rec):
         return False
     g = norm(rec.get(COL_G_KEY))
-    if not g:
-        return False
-    if not _OBJECT_API_RE.match(g):
-        # Checked G; it is a note, not an object API. Leave H blank.
-        rec["_referenceToGRejected"] = g
+    if not g or norm(rec.get(COL_H_KEY)):
         return False
     rec[COL_H_KEY] = g
-    rec["_referenceToSource"] = "G"
+    rec["_picklistSource"] = "G"
     return True
 
 
@@ -270,10 +285,10 @@ def build_col_map(header_row: list, jp_header_row: list | None = None) -> dict[i
     mislabels G, we disambiguate by the UNIQUE Japanese header substrings:
       * ``設定値`` → ``数式(設定値)`` (col H)  → Type Specific Value
       * ``デフォルト`` → ``デフォルト値`` (col L) → Default Value
-    The ``データ型に応じて…`` column (col G) is a description for formula,
-    picklist, and roll-up rows. Updated by Divakar N — 2026-10-05: a
-    Lookup / Master-Detail whose col H is blank uses col G as referenceTo
-    (``apply_lookup_ref_from_g``). H wins when both are filled.
+    The ``データ型に応じて…`` column (col G) is a user-facing description and
+    is never read as configuration. Updated by Divakar N — 2026-10-08: the
+    2026-10-05 Lookup col-G fallback is removed (client confirmed G is not
+    referred to by the tool).
     """
     col_map: dict[int, str] = {}
     jp = [norm(c) for c in (jp_header_row or [])]
@@ -342,7 +357,7 @@ def parse_object_header(grid: list[list], header_idx: int) -> dict:
     """
     meta = {"_type": "object_meta"}
     label = api = desc = ""
-    er = ea = eh = es = ""
+    er = ea = eh = es = ct = ""
     # Object-meta only: stop before the JP field-header row so field-column
     # labels (翻訳出典, 項目ラベル名 (EN)) are never read as object EN/provenance.
     meta_end = max(header_idx - 1, 0)
@@ -392,6 +407,12 @@ def parse_object_header(grid: list[list], header_idx: int) -> dict:
                         eh = v
                     elif key == "es":
                         es = v
+            # Updated by Divakar N — 2026-10-12. Why: the Create Tab flag was
+            # never parsed, and its column differs by tab (G6 on
+            # ExportLetterOfCreditInfo, H6 on others), so a TRUE flag went unseen.
+            ci = next((i for i, c in enumerate(labelrow) if c.startswith("タブ作成")), None)
+            if ci is not None:
+                ct = vals[ci] if ci < len(vals) else ""
     meta.update({
         "Object Label": label,
         "Object API Name": api,
@@ -400,6 +421,7 @@ def parse_object_header(grid: list[list], header_idx: int) -> dict:
         "enableActivities": ea,
         "enableHistory": eh,
         "enableSearch": es,
+        "createTab": ct,
     })
     unpack_packed(
         meta,
@@ -493,9 +515,8 @@ def parse_tab(title: str, grid: list[list], object_api_hint: str = "") -> list[d
         if cell_at(cells, "isdelete").lower() in DELETE_TRUE:
             delete_skipped += 1
             continue
-        # Lookup / Master-Detail: blank col H uses col G as referenceTo.
-        # Updated by Divakar N — 2026-10-05.
-        apply_lookup_ref_from_g(rec)
+        # Picklist: col H holds the values; blank H reads the labels from col G.
+        apply_picklist_values_from_g(rec)
         # capture Name field for the object's <nameField>
         if norm(rec.get("Field API Name")) == "Name":
             name_field = {

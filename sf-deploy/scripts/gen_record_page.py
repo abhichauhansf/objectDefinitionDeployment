@@ -150,7 +150,8 @@ def build(page_dev: str, master_label: str, sobject: str,
         want = desired_cols if len(fields) > 1 else 1
         ncols = max(want, cap_cols)
         chunk = -(-len(fields) // ncols)  # balanced chunk size
-        col_chunks = [fields[i:i + chunk] for i in range(0, len(fields), chunk)] or [[]]
+        # Z-shape (row-major): left col = items 1,3,5; right col = 2,4,6 (client request)
+        col_chunks = [fields[c::ncols] for c in range(ncols)] if fields else [[]]
 
         # fieldSection component instance in the main region
         inst = ET.SubElement(main, qn("itemInstances"))
@@ -206,6 +207,19 @@ def build(page_dev: str, master_label: str, sobject: str,
     return root
 
 
+def has_record_types(org: str, sobject: str) -> bool:
+    import subprocess
+    cp = subprocess.run(
+        ["sf", "data", "query", "--target-org", org, "--json", "--query",
+         f"SELECT COUNT() FROM RecordType WHERE SobjectType='{sobject}'"],
+        capture_output=True, text=True, timeout=120)
+    try:
+        return int(json.loads(cp.stdout)["result"]["totalSize"]) > 0
+    except (ValueError, KeyError, TypeError):
+        print(f"  ⚠️  record-type check failed for {sobject} — RecordTypeId dropped")
+        return False
+
+
 def main() -> int:
     ap = argparse.ArgumentParser()
     ap.add_argument("--fields", default=".build/flexi_fields.json")
@@ -216,6 +230,8 @@ def main() -> int:
                     help="columns per section (default 2 per "
                          "sf-flexipage-two-column-sections.mdc; do not lower to 1)")
     ap.add_argument("--only", default="", help="comma-separated tabs to (re)generate")
+    ap.add_argument("--org", default="",
+                    help="org alias; RecordTypeId is placed only if the object has record types there")
     ap.add_argument("--map", default=json.dumps({
         "Deal": ["TI_Fnt_Deal__c", "成約", "Deal_Record_Page"],
         "Shipping": ["TI_Fnt_Shipping__c", "輸出・出庫管理", "Shipping_Record_Page"],
@@ -235,6 +251,7 @@ def main() -> int:
             continue
         rows = sheet.get(tab, [])
         present_set = set(present.get(tab, []))
+        keep_rt = bool(args.org) and has_record_types(args.org, sobject)
         # group fields by section in first-appearance order, keeping only
         # org-present, non-disallowed fields
         order: list[str] = []
@@ -245,6 +262,12 @@ def main() -> int:
             sec = r.get("section") or "(blank)"
             # never-placeable system fields (incl. audit/owner fields)
             if api in HARD_DISALLOWED or api in STANDARD_NOT_PLACEABLE:
+                dropped += 1
+                continue
+            # Record.RecordTypeId fails deploy on an object with no record types.
+            if api == "RecordTypeId" and not keep_rt:
+                print(f"  ⚠️  {tab}: RecordTypeId dropped — no record types in the org"
+                      + ("" if args.org else " (pass --org to check)"))
                 dropped += 1
                 continue
             # custom fields must actually exist in the org; standard fields are

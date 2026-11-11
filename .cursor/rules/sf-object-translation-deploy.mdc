@@ -19,6 +19,25 @@ python scripts/prep_deploy.py --org "<ORG>" --tabs "<tab1>,<tab2>" --phase deplo
 `--apply-translations` is the gated sheet write of the translation batch
 (preview first, then confirm). It is not a second pipeline.
 
+<!-- Updated by Divakar N — 2026-10-26. Why: ERPPJ-1116 client questions
+     included an English-label review section; the user confirmed English
+     labels are not a client requirement. -->
+## Who the English labels are for
+
+English labels exist only for GDC developers who cannot read Japanese. They
+are **not** a client requirement; the client's Japanese labels are the
+deliverable.
+
+- Never ask the client (Yagai-san or anyone on the client side) about English
+  labels, and never put English-label items in client questions, Jira
+  comments to the client, or blocker notes.
+- Weak or unfitted English (DeepL `FIT` that lost meaning, `WARN` unfitted
+  labels left out of the package) is reported to the user only, as an
+  internal readability note. It never blocks a deploy.
+- If a label needs fixing, a GDC developer may type English into
+  `Field Label (EN)` (provenance `manual`), with the usual gated sheet write.
+  The ban on shortening labels with an LLM still applies.
+
 ## Flow (inserted into prep_deploy, not a fork)
 
 1. Live fetch of **selected `--tabs` only**.
@@ -36,8 +55,36 @@ python scripts/prep_deploy.py --org "<ORG>" --tabs "<tab1>,<tab2>" --phase deplo
    selected tabs → provider.
 5. One confirmation for the complete sheet-write batch (headers, EN, provenance).
 6. Stale-check immediately before write. Recalc + read calculated Google values.
-7. Existing `validate_sheet.py` **plus** translation ERRORs (blank/invalid EN
-   never degrades to WARN).
+7. Existing `validate_sheet.py --require-en` **plus** translation ERRORs
+   (after enrichment, blank/invalid EN never degrades to WARN).
+   <!-- Updated by Divakar N — 2026-10-07. Why: on a raw sheet, blank English
+        is work for step 2, not a blocker. -->
+   A standalone `validate_sheet.py` run (no `--require-en`) reports blank
+   English as INFO `translation.pending`, not an ERROR. Invalid English
+   (JA text, API name, placeholder) is still an ERROR in both modes.
+   <!-- Updated by Divakar N — 2026-10-07. Why: a long English label is a
+        wording problem DeepL can fix, not a reason to park the field. -->
+   **English longer than 40 characters is NOT a blocker** (WARN
+   `translation.length` in both modes). Step 3b handles it.
+3b. **DeepL length fit** (`fit_overlength_labels` → `DeepLProvider.translate_fit`).
+   Every Name / custom-field English over 40 characters, whether from the sheet,
+   DeepL, or Google, is re-translated from the Japanese by **DeepL** with
+   escalating `context` + `customInstructions` (`mcp_deepl.FIT_ATTEMPTS`).
+   <!-- Updated by Divakar N — 2026-10-14. Why: DeepL output varies per call;
+        one pass gave up on 減価償却費（含特償） (CompanyInfo row 23), which the
+        first prompt fits in most calls, so the field shipped with no English. -->
+   DeepL wording varies from call to call, so one pass is not enough: the
+   attempts are repeated for `mcp_deepl.FIT_ROUNDS` (3) rounds, on the
+   Japanese as written and on its half-width (NFKC) form, and the first result
+   of 40 characters or fewer wins. A label is reported unfitted only after
+   every round fails. DeepL is used here even in a Google batch. This
+   is the only exception to "one provider per batch". The fitted label is
+   written to the sheet with `deepl` provenance inside the same confirmed batch
+   (preview line `FIT`). If DeepL cannot fit it or is unavailable, the sheet
+   cell stays as is, the plan holds that label out of the package
+   (`MISSING_TRANSLATION`), and the preview shows a `WARN`. The field itself
+   still deploys. A Google result over 40 is not an abort either; the next run
+   fits it. Never shorten a label by hand or with an LLM.
 8. Fresh org snapshot (Tooling fields + CustomObjectTranslation).
 9. Immutable plan → schema XML + patched COT XML (org tree preserved).
 10. Manifest **from the plan**. Check-only, then real deploy, then live exact-EN verify.
@@ -87,10 +134,12 @@ record types.
 ## Must not
 
 - Write English into Japanese `CustomField.label`.
+- Ask the client to review, supply, or fix English labels.
 - Deploy blank translations.
 - Use API name / JA source / placeholder / formula text as English.
 - Scan or modify tabs that were not selected.
-- Change `fetch_sheet.py` / `write_back.py` Google authentication.
+- Change `fetch_sheet.py` / `write_back.py` Google authentication outside
+  `scripts/google_auth.py` (the shared login helper, see `google-sheet-auth.mdc`).
 - Call Cloud Translation API, a service-account JSON, or an LLM to generate
   English labels.
 - Use Cursor/Claude/another LLM to generate translations.

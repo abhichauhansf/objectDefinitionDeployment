@@ -8,6 +8,7 @@ succeed. Per the sheet-write-confirmation rule, default is a DRY-RUN preview
 (cell: old -> new); only --apply writes.
 
 Fixes are supplied as JSON: [{"field": "<API>", "column": "<Header>", "value": "<new>"}]
+`field` may be `row:<N>` (1-based sheet row) for rows whose fullName is still blank.
 Columns are located by HEADER NAME (normalized, case-insensitive), reshuffle-proof.
 
 Usage:
@@ -70,8 +71,11 @@ def main() -> int:
         except ValueError:
             print(f"  ⚠️  column '{colname}' not found in header — skipped {field}")
             continue
-        row = row_of.get(field)
-        if not row:
+        if field.lower().startswith("row:"):
+            row = int(field.split(":", 1)[1])
+        else:
+            row = row_of.get(field)
+        if not row or row - 1 >= len(grid):
             print(f"  ⚠️  field '{field}' not found on tab — skipped")
             continue
         cell = f"{col_letter(cidx)}{row}"

@@ -25,16 +25,14 @@ import sys
 sys.path.insert(0, "scripts")
 from fetch_sheet import (  # noqa: E402
     find_header_row, norm, GRAY_GUARD_SUBSTR, is_field_list_end, find_helper_cols, WIP_TRUE,
+    DELETE_TRUE,
 )
 from sheet_config import add_spreadsheet_id_arg  # noqa: E402
 
 
 def get_write_service():
-    from googleapiclient.discovery import build
-    import google.auth
-    scopes = ["https://www.googleapis.com/auth/spreadsheets"]
-    creds, _ = google.auth.default(scopes=scopes)
-    return build("sheets", "v4", credentials=creds, cache_discovery=False)
+    from google_auth import sheets_service
+    return sheets_service(write=True)
 
 
 def col_letter(idx0: int) -> str:
@@ -55,9 +53,10 @@ def live_field_rows(svc, sid: str, tab: str):
     header = [norm(c).lower() for c in grid[hidx]]
     label_col = header.index("label")
     full_col = header.index("fullname")
-    wip_idx = find_helper_cols(grid[hidx])["wip"]  # header-driven (AE fallback)
+    helpers = find_helper_cols(grid[hidx])  # header-driven (AD/AE fallback)
+    wip_idx, del_idx = helpers["wip"], helpers["isdelete"]
     rows = []
-    skipped_wip = 0
+    skipped_wip = skipped_del = 0
     for i in range(hidx + 1, len(grid)):
         cells = [norm(c) for c in grid[i]]
         if is_field_list_end(cells):
@@ -72,9 +71,16 @@ def live_field_rows(svc, sid: str, tab: str):
         if wip.strip().lower() in WIP_TRUE:
             skipped_wip += 1
             continue
+        # IsDelete rows are deletions, never named (fetch_sheet excludes them too).
+        isdel = cells[del_idx] if del_idx < len(cells) else ""
+        if isdel.strip().lower() in DELETE_TRUE:
+            skipped_del += 1
+            continue
         rows.append({"row": i + 1, "label": label, "full": full})
     if skipped_wip:
         print(f"(skipped {skipped_wip} WIP row(s) — not named/written)")
+    if skipped_del:
+        print(f"(skipped {skipped_del} IsDelete row(s) — not named/written)")
     return rows, full_col
 
 

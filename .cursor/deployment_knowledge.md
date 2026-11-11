@@ -23,6 +23,302 @@ entries on top. Written by the self-correction loop (see
 
 ## Lessons
 
+### [2026-11-05] Rich Text Area (Html) visibleLines 3 rejected ("Visible lines must be greater than 10")  «sig:7e33164857»
+- **Error signature:** `CustomField User.TI_Fnt_ElectronicSeal__c / User.TI_Fnt_ElectronicSignature__c: Visible lines must be greater than 10`
+- **Command:** `sf project deploy start --manifest manifest/erppj1150_package.xml --target-org TI_ERPDEV01 --test-level NoTestRun --wait 60 --dry-run` (ERPPJ-1150, via `deploy.py`)
+- **Component:** CustomField `User.TI_Fnt_ElectronicSignature__c`, `User.TI_Fnt_ElectronicSeal__c` (Rich Text Area, User sheet rows 18–19, Visible Lines blank)
+- **Category:** Schema
+- **Root cause:** `generate_xml.py` defaulted a blank Visible Lines to 3 for both LongTextArea and Html. Salesforce accepts 1+ for Long Text Area but requires 10–50 for Rich Text Area (Html). `validate_sheet.py` allowed 1–50 for Html, so the bad value was not caught before deploy.
+- **Fix applied:** `generate_xml.py` Html default for blank Visible Lines is now 25 (the Setup UI default). LongTextArea keeps 3.
+- **Prevention added:** `validate_sheet.py` RULES `Html.vl` range is now 10–50 (ERROR `constraint` for a sheet value below 10); the `visiblelines.default` WARN states the real default (25 for Html, 3 for LongTextArea).
+- **Status:** Resolved
+
+### [2026-10-26] Number with col F '0, 7' → precision = scale ("Precision must be greater than scale")
+- **Error signature:** `CustomField TI_Fnt_EDIShimamuraASlip__c.TI_Fnt_TaxRate__c: Precision must be greater than scale`; cascades `TI_Fnt_SalesPrice__c: Field TI_Fnt_TaxRate__c does not exist` and `CustomObjectTranslation … no CustomField named …TI_Fnt_TaxRate__c`
+- **Command:** `prep_deploy.py --org TI_ERPDEV01 --tabs EDIShimamuraASlip --phase build` (step 8 dry-run) — ERPPJ-1121. The auto-draft was deduped into «sig:500815fce8» (no error code extracted), so this entry was written by hand.
+- **Component:** CustomField `TI_Fnt_EDIShimamuraASlip__c.TI_Fnt_TaxRate__c` (Number, sheet row 79)
+- **Category:** Schema
+- **Root cause:** The client wrote `0,7` (0 integer digits, 7 decimals) for a tax rate → precision 7, scale 7. Salesforce requires precision > scale (at least one integer digit). `numeric_size.check_bounds` and the T/U check in `validate_sheet.py` only rejected scale > precision, so equal values passed.
+- **Fix applied:** `numeric_size.check_bounds` and `validate_sheet.py` numeric constraint now reject scale >= precision. Sheet value for row 79 decided with the user.
+- **Prevention added:** `validate_sheet.py` ERROR `numeric.size` (col F) / `constraint` (T/U) when scale >= precision, with the hint to write `1, <scale>`.
+- **Status:** Resolved
+
+### [2026-10-26] ERPPJ-1116 real deploy blocked by source-tracking conflict (recurrence of «sig:04ecb4af4e»)
+- **Error signature:** `Conflict │ TI_Fnt_BankMaster__c │ CustomObject` (20 files) and `Conflict │ TI_Fnt_PaymentTermsMaster__c │ CustomObject` (59 files)
+- **Command:** `prep_deploy.py --org TI_ERPDEV01 --phase deploy --tabs CompanyRatingHistory,…,StorageLocMaster` (real `deploy start`; the check-only run passed because `--dry-run` skips the conflict check)
+- **Component:** CustomObject `TI_Fnt_BankMaster__c`, `TI_Fnt_PaymentTermsMaster__c`
+- **Category:** Environment/Org
+- **Root cause:** Same as the 2026-10-12/14 lessons: both masters were created in the org outside local source tracking, and the plan relabelled their Name fields (JA sheet master: `銀行` → `銀行コード`, `決済条件テキスト` → `決済条件コード`) plus two PaymentTermsMaster field labels, so the object and every child field file were flagged.
+- **Fix applied:** Fresh `retrieve --target-metadata-dir --unzip` of both objects; order-insensitive diff. Only differences: the four intended relabels; PaymentTermsMaster's org list view and compact layout are absent locally (not deleted by a non-destructive deploy). Re-ran with `--ignore-conflicts` → 9 objects / 264 fields / 273 EN labels verified live.
+- **Prevention added:** None new; the existing diff-before-`--ignore-conflicts` procedure covered it.
+- **Status:** Resolved
+
+### [2026-10-26] AUTO-DRAFT: deploy validate (dry-run) failed (exit 1)  «sig:500815fce8»
+- **Error signature:** (none extracted)
+- **Command:** `sf project deploy start --manifest manifest/package.xml --target-org TI_ERPDEV01 --test-level NoTestRun --wait 60 --dry-run`
+- **Component:** CustomField `TI_Fnt_BankMaster__c.TI_Fnt_TIBankSerialNo6__c` / `TI_Fnt_TIBankSerialNo9__c` (AutoNumber), `TI_Fnt_BankMaster__c.TI_Fnt_BankCountryCodeText__c` (Formula Text), `TI_Fnt_StorageLocMaster__c.TI_Fnt_FaxNumber__c` / `TI_Fnt_PhoneNumber__c` (Phone); the two en_US CustomObjectTranslations failed only because those fields failed.
+- **Category:** Schema
+- **Extracted failure lines:**
+    Status: Failed
+    Status: Failed
+    Component Failures [7]
+    │ CustomField             │ TI_Fnt_BankMaster__c.TI_Fnt_TIBankSerialNo6__c     │ Invalid substitution variable (314:13)                                                                  │ 314:13      │
+    │ CustomField             │ TI_Fnt_BankMaster__c.TI_Fnt_TIBankSerialNo9__c     │ Invalid substitution variable (321:13)                                                                  │ 321:13      │
+- **Root cause:** (1) The client writes the first AutoNumber value inside the braces (`{000001}`, `{000010000}`); Salesforce allows only zeros there, and the starting number is a separate element. The generator copied col H verbatim and always set startingNumber 1. (2) The generator emitted `<length>` for Email/Phone/Url ("Can not specify 'length' for a CustomField of type Phone"); the validator only WARNed `forbidden.column`. (3) A Formula Text body of just `CountryList__c` (an object name, not a field) → "Field CountryList__c does not exist"; its lookup (row 17) has a blank col H and is parked.
+- **Fix applied:** `generate_xml.py`: new `split_autonumber_format()` turns `{000010000}` into displayFormat `{000000000}` + startingNumber 10000 (all zeros = start 1); Email/Phone/Url never emit `<length>`. BankMaster row 18 parked via `flag_blocker.py` pending the client.
+- **Prevention added:** `validate_sheet.py`: ERROR `formula.field` when a formula references a bare `…__c` that is not a field of the object on the sheet; ERROR `autonumber.format` when an AutoNumber format has no `{0…}` token; INFO `autonumber.start` showing how a non-zero token deploys.
+- **Status:** Resolved
+
+### [2026-10-26] DeepL length-fit aborted as "unauthenticated" on a successful translation
+- **Error signature:** `⛔ DeepL failed after a successful preflight … DeepL length-fit failed: MCP tool 'translate-text' is unauthenticated. Run: mcp-adaptor auth` followed by the translated text `Sequential Number For Payment Terms Code (Intangible Promissory Note)`
+- **Command:** `prep_deploy.py --org TI_ERPDEV01 --phase build --tabs CompanyRatingHistory,…,StorageLocMaster` (step 2, DeepL length fit) — ERPPJ-1116
+- **Component:** `scripts/mcp_client.py` `is_auth_failure` / `McpClient._unwrap_tool_result`
+- **Category:** Tooling
+- **Root cause:** `_unwrap_tool_result` also scans SUCCESSFUL tool results for auth keywords, and `is_auth_failure` used plain substring matching. The needle `sso` matched inside "Promi**sso**ry" (DeepL's English for 無形手形), so a good translation was raised as `McpAuthError` and the whole translation batch was discarded. A direct DeepL call with the same input succeeded, confirming the key was fine.
+- **Fix applied:** `is_auth_failure` now matches the keywords as whole words (`\b…\b` regex). Real auth errors (`403 Forbidden`, `unauthenticated`, `SSO session expired`, `mcp-adaptor auth`) are still detected; "Promissory", "Class 4012" are not.
+- **Prevention added:** Tooling-only (no sheet check applies — the input was a valid label). Checked by hand against the failing text and real auth messages.
+- **Status:** Resolved
+
+### [2026-10-21] FlexiPage IsDelete scan matched same API name on a different object
+- **Error signature:** `BLOCKED … TI_Fnt_StandaloneIncidentalExpenses__c.TI_Fnt_InternalReservationNo__c -> TI_Fnt_InternalReservation_Record_Page`
+- **Command:** `build_destructive.py --tabs IncidentalExpenses,StandaloneIncidentalExpenses,TINETAccount --target-org TI_ERPDEV01`
+- **Component:** `build_destructive.flexipage_refs`
+- **Category:** Tooling
+- **Root cause:** The page scan grepped `Record.<Field>` in every FlexiPage body. Several objects share field API names (`TI_Fnt_InternalReservationNo__c` on StandaloneIncidentalExpenses AND InternalReservation; `TI_Fnt_SWIFTCode__c` on TINETAccount AND ImportPurchase). Hits on another object's page are not Salesforce delete blockers.
+- **Fix applied:** `flexipage_refs` now reads `<sobjectType>` and ignores pages whose object is not the field's object.
+- **Prevention added:** Same function (no sheet check — this is org page XML). Empty-retrieve fail-closed path unchanged.
+- **Status:** Resolved
+
+### [2026-10-21] FlexiPage retrieve via comma-joined `--metadata` returns empty and false-blocks IsDelete
+- **Error signature:** `FlexiPage retrieve returned no page files` / `treating as BLOCKED` / `Entity of type 'FlexiPage' named 'A,FlexiPage:B,…' cannot be found`
+- **Command:** `build_destructive.py --tabs … --target-org TI_ERPDEV01` (and `sf project retrieve start --metadata FlexiPage:a,FlexiPage:b`)
+- **Component:** FlexiPage retrieve used by `build_destructive.flexipage_refs`
+- **Category:** Tooling
+- **Root cause:** `sf project retrieve start --metadata` takes one `Type:Member` string. Joining `FlexiPage:page1,FlexiPage:page2` is parsed as a single member named `page1,FlexiPage:page2`, so the retrieve succeeds with zero files. `flexipage_refs` then fail-closed and marked every IsDelete field BLOCKED (`<unverified: retrieve empty>`), which parked the ERPPJ-1113 delete set even though only a few fields were actually on a page.
+- **Fix applied:** `scripts/build_destructive.py` `flexipage_refs` now writes a `package.xml` and retrieves in batches of 40. ERPPJ-1113 pages were retrieved that way, 19 `fieldInstance`s unplaced (SIE record page + TINET Supplier / Supplier_v2), and those three FlexiPages deployed (`0AfBK00000D1ih30AB`).
+- **Prevention added:** Do not comma-join multiple `FlexiPage:` members on `--metadata`. There is no `validate_sheet.py` check — this is an org retrieve, not a sheet attribute. The empty-retrieve fail-closed path remains as a last resort if a batch still returns no files.
+- **Status:** Resolved
+
+### [2026-10-21] Picklist label already in org — sheet ApiName cannot rename it  «sig:dceb2afa34»
+- **Error signature:** `Duplicate label: 販売員手数料：単価`
+- **Command:** `sf project deploy start --manifest manifest/package.xml --target-org TI_ERPDEV01 --test-level NoTestRun --wait 60 --dry-run`
+- **Component:** CustomField `TI_Fnt_StandaloneIncidentalExpenses__c.TI_Fnt_IncidentalExpensesClass2__c`
+- **Category:** Schema
+- **Extracted failure lines:**
+    Status: Failed
+    Component Failures [1]
+    │ CustomField │ TI_Fnt_StandaloneIncidentalExpenses__c.TI_Fnt_IncidentalExpensesClass2__c │ Duplicate label: 販売員手数料：単価 (14:13) │ 14:13       │
+- **Root cause:** The sheet listed Class2 as `販売員手数料：単価:DW5` (and 49 similar AAA→AA4 style recodes). The org already had those labels under different `fullName`s (`DWB`, `AAA`, …). Metadata API cannot rename a picklist value, and Salesforce rejects two values with the same label. `split_entry` had been fixed so full-width `：` stays in the label; uniqueness within the sheet was then fine, but the collision with live org values was not checked.
+- **Fix applied:** `picklist_api.resolve_against_org` keeps the org ApiName when the label already exists. `generate_xml.py --target-org` emits that ApiName. Col H on StandaloneIncidentalExpenses row 28 was written back (50 org codes kept, 37 new labels keep the sheet codes). IncidentalExpenses Class2 had no org-label collision (9 provisional values) so it kept the sheet codes.
+- **Prevention added:** `validate_sheet.py --target-org` ERROR `picklist.org_api` when a sheet ApiName differs from the org ApiName for the same label. Rule `sf-deploy-delta-and-blockers.mdc` documents the keep-org-ApiName write-back.
+- **Status:** Resolved
+
+### [2026-10-21] Uncountable head noun pluralized ("Financial Informations") → plural guard abort
+- **Error signature:** `⛔ object plural English is identical to singular ('Financial Information (Non-Consolidated)')`
+- **Command:** `prep_deploy.py --org TI_ERPDEV01 --tabs FinancialInfoNonConsol,FinancialInfoConsol --phase build --apply-translations` (step 6, `generate_object_translation.py`)
+- **Component:** CustomObjectTranslation `TI_Fnt_FinancialInfoNonConsol__c-en_US` (and `TI_Fnt_FinancialInfoConsol__c-en_US`, which would have shipped a wrong plural silently)
+- **Category:** Tooling
+- **Root cause:** `translate_enrich._plural_word` added `s` to every head noun, including mass nouns. "Financial Information (Consolidated)" became "Financial Informations (Consolidated)" (36 chars, packaged without complaint). The NonConsol label is exactly 40 chars, so the wrong plural overflowed, `english_plural_label` fell back to the singular, and the generator guard aborted. Caught before any dry-run; no org write.
+- **Fix applied:** `scripts/translate_enrich.py` — new `_PLURAL_UNCOUNTABLE` set (information, data, equipment, freight, cargo, merchandise, machinery, …); `_plural_word` returns mass nouns unchanged, so `ends_in_plural_word` is True and the generator accepts an identical plural. `TI_Fnt_CompanyInfo__c` ("Company Information") already in the org likely carries the plural "Company Informations"; it will be corrected on its next translation deploy.
+- **Prevention added:** The existing generator guard in `generate_object_translation.py` (identical plural rejected unless the last word is already plural) is what caught this; it now also passes legitimate mass nouns. No `validate_sheet.py` check: the sheet English was correct; the defect was in plural derivation only.
+- **Status:** Resolved
+
+### [2026-10-19] New-object FlexiPage placed Record.RecordTypeId on an object with no record types (+ tracking conflicts on a field recreate)
+- **Error signature:** `FlexiPage TI_Fnt_CreditReportRequest_Record_Page: Something went wrong. We couldn't retrieve or load the information on the field: Record.RecordTypeId.`; separately `There are changes in the org that conflict with the local changes` on the SIE page unplace and on the destructive delete of `TI_Fnt_StandaloneIncidentalExpenses__c.TI_Fnt_PartnerBank__c`
+- **Command:** `deploy.py --package manifest/crr_flexipage.xml` (dry-run); `deploy.py --start --package manifest/sie_recreate_page.xml`; `deploy.py --start --pre-destructive manifest/sie_recreate_destructive.xml`
+- **Component:** FlexiPage `TI_Fnt_CreditReportRequest_Record_Page`; FlexiPage `TI_Fnt_StandaloneIncidentalExpenses_Record_Page`; CustomField `TI_Fnt_StandaloneIncidentalExpenses__c.TI_Fnt_PartnerBank__c`
+- **Category:** Schema (RecordTypeId); Environment/Org (conflicts)
+- **Root cause:** The CreditReportRequest sheet places the standard `RecordType` row on the page, and `gen_tabbed_page.py` treated `RecordTypeId` as always placeable. The sheet's Domestic/Overseas record types are not deployed by the pipeline, so the new object had none, and Salesforce rejects the field instance. The auto-draft deduped onto «sig:b6721858db», so this entry was written by hand. The conflicts are the known no-baseline source-tracking case (2026-10-12/14 lessons): the page and the old field were created outside local tracking.
+- **Fix applied:** `scripts/gen_tabbed_page.py` and `scripts/gen_record_page.py` take `--org` and place `RecordTypeId` only when `RecordType` has rows for the object; without `--org` it is dropped with a warning. CRR page regenerated (33 fields), deployed and set as org default. Conflicts: local page = fresh org retrieve minus the two `fieldInstance` blocks, and the destructive set only deletes, so `--ignore-conflicts` was used after that check.
+- **Prevention added:** Generator guard above (the sheet row is valid; whether it is placeable depends on the org, so there is no `validate_sheet.py` check). No new guard for the conflicts — the existing diff-before-`--ignore-conflicts` procedure covered them.
+- **Status:** Resolved
+
+### [2026-10-19] CRR FlexiPage real deploy failed on Record.RecordTypeId  «sig:523fba33c6»
+- **Error signature:** `We couldn't retrieve or load the information on the field: Record.RecordTypeId.`
+- **Command:** `sf project deploy start --manifest manifest/crr_flexipage.xml --target-org TI_ERPDEV01 --test-level NoTestRun --wait 60`
+- **Component:** FlexiPage `TI_Fnt_CreditReportRequest_Record_Page`
+- **Category:** Schema
+- **Extracted failure lines:**
+    Status: Failed
+    Component Failures [1]
+- **Root cause:** Same failure as the dry-run in the entry above (object has no record types; generator placed RecordTypeId).
+- **Fix applied:** See the entry above — generators place RecordTypeId only with `--org` confirming record types; page regenerated and deployed.
+- **Prevention added:** Generator guard in `gen_tabbed_page.py` / `gen_record_page.py` (entry above).
+- **Status:** Resolved
+
+### [2026-10-19] ERPPJ-1097 dry-run: User relationship name already taken + lookup traversed with `__c.` in formulas  «sig:f2e09a7c44»
+- **Error signature:** `There is already a Child Relationship named Receiving_TI_Fnt_JSOXCheckManagerPerson on User` / `Duplicate relationship name` / `Field TI_Fnt_Buyer__c does not exist. Check spelling.`
+- **Command:** `sf project deploy start --manifest manifest/package.xml --target-org TI_ERPDEV01 --test-level NoTestRun --wait 60 --dry-run`
+- **Component:** CustomField `TI_Fnt_IncidentalExpenses__c.TI_Fnt_JSOXCheckManagerPerson__c`, `TI_Fnt_StandaloneIncidentalExpenses__c.TI_Fnt_JSOXCheckManagerPerson__c`; 8 Formula Text fields `TI_Fnt_SpecificBulkLicense__c.TI_Fnt_{Buyer,Consignee,Demander1-6}CompanyName*__c` (+2 CustomObjectTranslation failures that only followed from the missing fields)
+- **Category:** Schema
+- **Extracted failure lines:**
+    Status: Failed
+    Component Failures [13]
+    │ CustomField             │ TI_Fnt_StandaloneIncidentalExpenses__c.TI_Fnt_JSOXCheckManagerPerson__c │ Duplicate relationship name: Receiving_TI_Fnt_JSOXCheckManagerPerson                                                              │             │
+- **Root cause:** (1) The IE and SIE sheets had col X = `Receiving_TI_Fnt_JSOXCheckManagerPerson`, copied from the Receiving tab. Child relationship names are unique per PARENT, and Receiving already owns that name on User; both new fields also used it in the same batch. The existing `relationshipname.collision` guard missed it because `collect_reference_targets` only returned custom (`__c`) parents, so User was never described. (2) SpecificBulkLicense formulas wrote `TI_Fnt_Buyer__c.CompanyNameSAPDisplayName__c`; a lookup must be traversed as `TI_Fnt_Buyer__r.`. The existing hop check only looked at `__r.` paths and the `__c__r` typo.
+- **Fix applied:** Sheet (gated, with AH `[FIX]` notes): IE X182 → `IncidentalEx_JSOXCheckManagerPerson`, SIE X222 → `SIE_JSOXCheckManagerPerson` (derived by `relname.derive_relationship_name`); SBL H27/30/33/36/39/42/45/48 `__c.` → `__r.`. Rebuild: validation 0 errors, dry-run passed.
+- **Prevention added:** `scripts/validate_sheet.py` — child relationships are now described for standard parents too (`collect_reference_targets(include_standard=True)`); new ERROR `relationshipname.batchdup` (same name on the same parent twice in one deploy); new ERROR `formula.rel.dot` (`<Lookup>__c.` where `<Lookup>__c` is a lookup on the object). Re-ran validation on the failing rows: all 11 errors caught before the dry-run.
+- **Status:** Resolved
+
+### [2026-10-14] ExportClassificationRequest field deploy blocked by source-tracking conflict (recurrence of «sig:04ecb4af4e»)
+- **Error signature:** `Conflict │ TI_Fnt_ExportClassificationRequest__c │ CustomObject` (object-meta + 16 field files) / `There are changes in the org that conflict with the local changes you're trying to deploy.`
+- **Command:** `prep_deploy.py --org TI_ERPDEV01 --tabs ExportClassificationRequest --rows-from .build/ecr_rows_live.json --phase deploy`
+- **Component:** CustomObject `TI_Fnt_ExportClassificationRequest__c`
+- **Category:** Environment/Org
+- **Root cause:** Same as the 2026-10-12 lessons. The object (with `TI_Fnt_ApprovalStatus__c` and `TI_Fnt_ExportControlClassification__c`) was created in the org outside this project, so local source tracking had no baseline; the plan relabelled the Name field (sheet JA master: `該非判定書発行依頼No` → `該非判定書発行依頼No.`), so the CustomObject and every child field file were flagged. The check-only run passed because `--dry-run` skips the conflict check. The auto-draft deduped onto the existing signature, so this entry was added by hand.
+- **Fix applied:** Fresh `retrieve --target-metadata-dir --unzip`; order-insensitive diff of object settings and fields. Only difference: the intended Name-label relabel; `TI_Fnt_ApprovalStatus__c` identical; org-only `TI_Fnt_ExportControlClassification__c` not in the package. Re-ran with `--ignore-conflicts` → deployed, 16/16 fields and 18 EN labels verified live.
+- **Prevention added:** None new — the existing diff-before-`--ignore-conflicts` procedure covered it.
+- **Status:** Resolved
+
+### [2026-10-14] Post-deploy verification failed right after a successful deploy, then passed unchanged
+- **Error signature:** `⛔ VERIFICATION FAILED — the deploy did NOT fully land` from `prep_deploy.py --phase deploy`; `verify_deploy.py` details missing from the captured output
+- **Command:** `prep_deploy.py --org TI_ERPDEV01 --tabs CreditLimitUpdate --phase deploy --rows-from .build/creditlimitupdate_rows.json` (deploy 0AfBK00000Csrmn0AB, Status: Succeeded, 11/11 components)
+- **Component:** CustomObject `TI_Fnt_CreditLimitUpdate__c` (+9 CustomField, CustomObjectTranslation en_US)
+- **Category:** Tooling
+- **Root cause:** `verify_deploy.py` ran immediately after `deploy start` and exited non-zero. The same command, in the same environment (`sf_env`), passed seconds later with no change in the org (object, 9/9 fields and 11/11 English labels confirmed), so the first read most likely hit org read-after-write lag. The failure detail was lost because the parent process's buffered stdout was not flushed before the child ran: the child's output landed ahead of the parent's text and was cut by `tail`.
+- **Fix applied:** `scripts/prep_deploy.py` — flush stdout before verification, and on a non-zero verify re-check once after 30s before declaring failure. A persistent mismatch still fails the batch.
+- **Prevention added:** No `validate_sheet.py` guard: the sheet and metadata were valid; this is a verification-timing issue, not a sheet defect. The retry above is the guard.
+- **Status:** Monitoring
+
+### [2026-10-13] New-object translation with no usable English object/Name label → "StartsWith is required for language ENGLISH"  «sig:b6721858db»
+- **Error signature:** `CustomObjectTranslation TI_Fnt_CompanyInfoTransactionDetail__c-en_US: StartsWith is required for language ENGLISH`
+- **Command:** `sf project deploy start --manifest manifest/package.xml --target-org TI_ERPDEV01 --test-level NoTestRun --wait 60 --dry-run`
+- **Component:** CustomObjectTranslation `TI_Fnt_CompanyInfoTransactionDetail__c-en_US`
+- **Category:** Schema
+- **Extracted failure lines:**
+    Status: Failed
+    Status: Failed
+    Component Failures [1]
+- **Root cause:** The object English label and the Name English label were both 48 chars ("Company Information Details (Transaction Status)"); DeepL could not fit them to 40, so both were held out of the plan. `generate_object_translation.patch_tree` then fell back to `case_carrier` = the JAPANESE object master and wrote it as English `caseValues` (singular `企業情報明細(取引状況)`, plural `…取引状況s`). `startsWith` was only computed when a Name label existed, so the file had caseValues but no startsWith, which Salesforce rejects for English. The carrier exists only so a Name translation can apply; with no Name label it must not be emitted.
+- **Fix applied:** `scripts/generate_object_translation.py` — the carrier is used only when a Name label is packaged; `startsWith` is derived whenever caseValues are emitted; `render_object_file` now refuses caseValues without startsWith. Regenerated file has field translations only; dry-run passed.
+- **Prevention added:** `scripts/validate_sheet.py` — WARN `translation.object_none` when both the object English and Name EN exceed 40 chars (the object will get no English label in the org; shorten Name EN on the sheet to fix). Generator guard above blocks the bad XML before deploy.
+- **Status:** Resolved
+
+### [2026-10-12] Metadata API cannot delete picklist values (only deactivates them)
+- **Error signature:** none (deploys succeeded) — removed values reappear as `<isActive>false</isActive>`
+- **Command:** `deploy.py --start --package manifest/tinet_pk_cleanup_package.xml` (restricted=false without A–D: 0AfBK00000CqltZ0AR; then restricted=true: 0AfBK00000CqlyP0AR)
+- **Component:** CustomField `TI_Logi_TINETAccount__c.TI_Fnt_BPFrontLegalPersonality__c`, `…BPAfterLegalPersonality__c`, `…ShipToRiskRating__c`
+- **Category:** Environment/Org
+- **Root cause:** Omitting a value from a picklist's value set in a Metadata deploy only deactivates it. Flipping the picklist to unrestricted and redeploying without the values did not delete them either: while unrestricted, `readMetadata`, `retrieve`, Tooling `CustomField.Metadata` and `PicklistValueInfo` all simply hide inactive values, so the values looked deleted. When restricted was turned back on, A/B/C/D were listed again as inactive.
+- **Fix applied:** None possible through the Metadata/Tooling API. The org was left as it was (restricted, A–D inactive). Deleting the values needs Setup → field → Inactive Values → Del (Salesforce then asks whether to blank or replace values on existing records).
+- **Prevention added:** Do not report picklist values as "removed" from a metadata read of an UNRESTRICTED picklist — inactive values are invisible there. Only the restricted-picklist view (or Setup) shows them. Build picklist field files from a FRESH org retrieve taken after any earlier deploy in the same session (a stale copy reverted a JA label on 2026-10-12).
+- **Status:** Monitoring
+
+### [2026-10-12] TINETAccount JA-relabel deploy blocked by source-tracking conflict  «sig:04ecb4af4e»
+- **Error signature:** STATE
+- **Command:** `sf project deploy start --manifest manifest/package.xml --target-org TI_ERPDEV01 --test-level NoTestRun --wait 60`
+- **Component:** CustomObject `TI_Logi_TINETAccount__c` (object-meta + all 150 local field files)
+- **Category:** Tooling
+- **Extracted failure lines:**
+    │ Conflict │ TI_Logi_TINETAccount__c │ CustomObject │ /Users/divakar.n/Cursor Projects/Toray/sf-deploy/force-app/main/default/objects/TI_Logi_TINETAccount__c/fields/TI_Fnt_ShipToSTCAnnotation__c.field-meta.xml        │
+    Error (1): There are changes in the org that conflict with the local changes you're trying to deploy.
+- **Root cause:** Same as the ExportLetterOfCreditInfo lesson below. The plan relabelled 11 fields + the Name field (sheet JA labels are master), so the whole CustomObject was in the package; `TI_Logi_TINETAccount__c` is a TI_Logi object edited by other users, so local source tracking had no current baseline and every child file was reported as a conflict. The check-only run passed because `--dry-run` skips the conflict check.
+- **Fix applied:** Fresh `retrieve --target-metadata-dir --unzip` of the object; order-insensitive diff of object-meta and all 150 local field files against the org copy. Only differences: the 11 intended field `<label>` changes and the Name-field label (TINET取引先名 → 取引先名); value sets, lookup filters, types, lengths and `actionOverrides` identical (raw text diffs on `valueSet`/`lookupFilter` were element order only). Re-ran `prep_deploy.py --phase deploy --park-rows 88 --ignore-conflicts` → Deploy ID 0AfBK00000Cqk1R0AR, verified live.
+- **Prevention added:** None new — the existing procedure (diff before `--ignore-conflicts`) covered it. When diffing, compare elements order-insensitively; a raw text diff falsely shows `valueSet` changes on picklists.
+- **Status:** Resolved
+
+### [2026-10-12] prep_deploy real deploy blocked by source-tracking conflict on a pre-existing empty object
+- **Error signature:** `Conflict │ TI_Fnt_ExportLetterOfCreditInfo__c │ CustomObject` (object-meta + all 46 new field files) / `There are changes in the org that conflict with the local changes you're trying to deploy.`
+- **Command:** `sf project deploy start --manifest manifest/package.xml --target-org TI_ERPDEV01 --test-level NoTestRun --wait 60` (via `prep_deploy.py --phase deploy`)
+- **Component:** CustomObject `TI_Fnt_ExportLetterOfCreditInfo__c`
+- **Category:** Tooling
+- **Root cause:** The object was created in the org by another user (2026-09-09) with no fields, so local source tracking had no baseline for it. The check-only run passed because `--dry-run` skips the conflict check; the real `deploy start` flagged the whole CustomObject (every child field file counts as part of it) as a conflict. Nothing had actually diverged: a fresh mdapi retrieve showed the org object identical to the local object-meta except the intended Name-label relabel. `deploy.py`'s auto-draft did not fire, so this entry was added by hand.
+- **Fix applied:** `prep_deploy.py` gained an opt-in `--ignore-conflicts` that is passed through to `deploy.py --start` (previously only `deploy.py` had it, which forced hand-run deploys outside the orchestrator). Re-ran `prep_deploy.py --phase deploy --ignore-conflicts` → deployed + verified 46/46 fields, 48 EN labels.
+- **Prevention added:** Procedure (same as the 2026-10-05 lesson): before passing `--ignore-conflicts`, retrieve the conflicting CustomObject with `--target-metadata-dir --unzip`, strip `<fields>`, and diff against the local object-meta; use the flag only when the only differences are the intended change. Not a `validate_sheet.py` rule — the sheet was correct; the gap is source-tracking state.
+- **Status:** Resolved
+
+### [2026-10-12] generate_xml.py ignored prep_deploy --out and generated another object  «sig:e194b83add»
+- **Error signature:** `Invalid object name: TI_Fnt_InternalReservation__c` on the CustomObjectTranslation of a NEW object
+- **Command:** `sf project deploy start --manifest manifest/package.xml --target-org TI_ERPDEV01 --test-level NoTestRun --wait 60 --dry-run`
+- **Component:** `CustomObjectTranslation:TI_Fnt_InternalReservation__c-en_US` (and the whole `TI_Fnt_InternalReservation__c` CustomObject/CustomField set, which had no source files)
+- **Category:** Tooling
+- **Extracted failure lines:**
+    Status: Failed
+    Component Failures [1]
+    │ CustomObjectTranslation │ TI_Fnt_InternalReservation__c-en_US │ Invalid object name: TI_Fnt_InternalReservation__c │             │
+- **Root cause:** `prep_deploy.py --rows-from … --out .build/ir_temp.json` validated and planned from `--out`, but step 6 called `generate_xml.py` with no input argument and it always read `temp_updates.json`. That file held another session's object (`TI_Fnt_ExportLetterOfCreditInfoBalance__c`), so the planned object and its 13 fields were never generated; the manifest (built from the plan) listed them and only the translation file existed, so Salesforce rejected the translation for an unknown object.
+- **Fix applied:** `generate_xml.py` takes `--in` (default `temp_updates.json`); `prep_deploy.py` passes `--in <temp_path>` so generation reads the same rows as validation and planning.
+- **Prevention added:** `prep_deploy.missing_planned_sources()` runs after generation and stops the build before the dry-run if any planned CustomObject/CustomField has no file under `force-app` (verified: it reported 14 missing for this run's plan before the fix). Not a `validate_sheet.py` rule because the sheet was correct; the gap was between plan and generated source.
+- **Status:** Resolved
+
+### [2026-10-12] Concurrent runs in sf-deploy/ overwrote each other's working files
+- **Error signature:** `verify_deploy.py --plan .build/deploy_plan.json` reported another object's labels (`TI_Fnt_QuotationCargoInfo__c`, org '' != sheet …) while verifying `TI_Fnt_QuoteCostLineItem__c`; earlier the same day a BookingRequestDetail dry-run packaged `TI_Fnt_QuotationCargoInfo__c`
+- **Command:** two sessions running `prep_deploy.py` / `deploy.py` from `sf-deploy/` at the same time
+- **Component:** `temp_updates.json`, `.build/deploy_plan.json`, `.build/validation_report.json`, `.build/last_deploy.log`
+- **Category:** Tooling
+- **Root cause:** all pipeline working files are relative to the current directory and nothing stopped a second run from starting in the same folder, so one run read (or packaged) the other's plan mid-flight. The "blank label" result was a timing artefact; the other deploy landed a minute later and verified clean.
+- **Fix applied:** new `scripts/run_lock.py`; `prep_deploy.py` and `deploy.py` take `.build/run.lock` in the current directory at start. A second run in the same folder exits 3 naming the holder (script, pid, start time, args). Child processes inherit the lock via `SF_DEPLOY_RUN_LOCK`; a lock whose pid is dead is taken over; the lock is released on exit. `work/<name>` copies keep separate locks.
+- **Prevention added:** the lock itself (tested: second run blocked, child passes, stale lock taken over, released on exit).
+- **Status:** Resolved
+
+### [2026-10-12] Text formula returned a parent picklist without TEXT()
+- **Error signature:** `Field ExpensesItemLargeCategory__c is a picklist field. Picklist fields are only supported in certain functions.` (3 fields)
+- **Command:** `sf project deploy start --manifest manifest/package.xml --target-org TI_ERPDEV01 --test-level NoTestRun --wait 60 --dry-run` (via `prep_deploy.py --tabs QuoteCostLineItem --rows-from …`)
+- **Component:** Formula Text CustomFields `TI_Fnt_QuoteCostLineItem__c.TI_Fnt_CostItemLargeCategory__c` / `…MiddleCategory__c` / `…SmallCategory__c`
+- **Category:** Schema
+- **Root cause:** the sheet formulas were bare paths `TI_Fnt_CostItemCode__r.ExpensesItem*Category__c`. Those fields on `TI_Logi_CostItemMaster__c` are picklists, and a formula can only read a picklist through `TEXT()` / `ISPICKVAL()` / `CASE()` and similar functions. `sobject describe` does not show the three fields (no FLS for the running user), so nothing upstream knew they were picklists.
+- **Fix applied:** formula body comes verbatim from sheet col H, so the fix is in the sheet: H19:H21 wrapped in `TEXT(...)` (gated write + AH `[FIX]` note). No generator change.
+- **Prevention added:** `validate_sheet.py` `formula.picklist` ERROR (with `--target-org`): for every `X__r.Field` in a formula, if `X__c` is a Lookup/MasterDetail on the same object whose referenceTo has `Field` as a picklist (Tooling `FieldDefinition DataType LIKE 'Picklist%'`, FLS-independent), the reference must sit directly inside a picklist-safe function. Catches all 3 here; passes once wrapped.
+- **Status:** Resolved (sheet H19:H21 wrapped in TEXT(); dry-run passed 2026-10-12)
+
+### [2026-10-12] Formula path `X__r.` did not match the generated lookup name  «sig:bedac45f3a»
+- **Error signature:** `Field TI_Fnt_SDS__r does not exist. Check spelling.` (20 fields) / `Field TI_Fnt_ContainerCertificate__r does not exist.` (2 fields)
+- **Command:** `sf project deploy start --manifest manifest/package.xml --target-org TI_ERPDEV01 --test-level NoTestRun --wait 60 --dry-run` (via `prep_deploy.py --tabs BookingRequestDetail --rows-from …`, isolated in `work/brd_20261012`)
+- **Component:** 22 Formula Text CustomFields on `TI_Fnt_BookingRequestDetail__c` (e.g. `TI_Fnt_FireHazardousMaterial__c`, `TI_Fnt_OuterPackagingTypeCode__c`)
+- **Category:** Schema
+- **Root cause:** the client wrote the formulas as `TI_Fnt_SDS__r.<field>` / `TI_Fnt_ContainerCertificate__r.<field>`, which assumes the lookups on this object are named `TI_Fnt_SDS__c` / `TI_Fnt_ContainerCertificate__c`. The lookups had a blank col D and `name_fields.py` named them from their labels (`正式品名(英語)` → `TI_Fnt_OfficialItemNameEN__c`, `容器名称` → `TI_Fnt_ContainerName__c`), so the `__r` path pointed at a field that does not exist.
+- **Fix applied:** `name_fields.py` now names a blank-API Lookup/MasterDetail after the formula path when a formula on the same object uses `<X>__r.` and the lookup's referenceTo (col H) is `<X>__c` (method `formula-path`, High). Sheet D18/D32 to be renamed to `TI_Fnt_SDS__c` / `TI_Fnt_ContainerCertificate__c` (gated write).
+- **Prevention added:** `validate_sheet.py` `formula.rel.field` ERROR: the first `X__r.` hop of every formula must match a Lookup/MasterDetail `X__c` on the same object. Catches all 22 here; 0 false positives on the Deal / Receiving / EDIReceipt / DFLM / DealDetail row sets.
+- **Also seen:** another session ran `prep_deploy.py` in `sf-deploy/` at the same time and overwrote the shared `temp_updates.json` / `.build/validation_report.json` / `.build/deploy_plan.json` mid-build (the dry-run packaged `TI_Fnt_QuotationCargoInfo__c`). Run concurrent deploys from separate `work/<name>` copies.
+- **Status:** Resolved (dry-run and real deploy passed after the rename, 2026-10-12)
+
+### [2026-10-08] Picklist values read from col G against the client's column contract
+- **Error signature:** none at deploy time; the client (Yagai-san) pointed out that col G is a user-facing explanation and only col H is configuration (same as Abhi's 2026-09-03 request "refer to H but not G")
+- **Command:** `fetch_sheet.py` / `_mcp_csv_to_temp.py` → `validate_sheet.py` (all tabs)
+- **Component:** every Picklist / MultiselectPicklist row (e.g. `TI_Fnt_EDIReceipt__c` rows 17, 18, 23)
+- **Category:** Tooling
+- **Root cause:** the 2026-10-07 change made col G the primary picklist source because its header reads 選択リスト→選択リスト値. The client's contract is the opposite: G explains, H configures. A ';'-separated explanation in G would have replaced the H value set.
+- **Fix applied:** `fetch_sheet.apply_picklist_values_from_g` replaced by `note_picklist_col_g`, which never copies G into the value. `picklist_api.py` always writes back to col H. The 2026-10-05 Lookup fallback `apply_lookup_ref_from_g` is removed from `fetch_sheet.py`, `validate_sheet.py` and `generate_xml.py` for the same reason. Rules `sf-deploy-delta-and-blockers.mdc` and `sf-sheet-deployment.mdc` updated to "col H only; col G is never read".
+- **Prevention added:** `validate_sheet.py` `picklist.source` is now an ERROR when the values exist only in col G (H blank), telling the client to move them to H. The old G-vs-H WARNs are removed.
+- **Follow-up (same day, agreed with Yagai-san):** col H header renamed `value`; col L is the picklist default; col G is the customer view. Picklists only: blank H reads the labels from G (`apply_picklist_values_from_g`), `picklist_api.py` generates API names, and the list is written to col H. `picklist.source` is a WARN for G-sourced rows, and `prep_deploy.py` step 2b stops until col H is written. Lookups stay col H only.
+- **Status:** Resolved
+
+### [2026-10-07] Picklist "col G first" read client notes as the value set (caught before deploy)
+- **Error signature:** `picklist.source` WARN on 16 Receiving picklists; values like `要⏎不要` / `P:買付⏎S:販売` / `CY,CFS` reported as ONE value with no ApiName
+- **Command:** `validate_sheet.py --in temp_updates.json --target-org TI_ERPDEV01 --require-en` (Receiving tab, validate + drift only; no deploy)
+- **Component:** CustomField picklists on `TI_Fnt_Receiving__c` (e.g. `TI_Fnt_BuySellType__c`, `TI_Fnt_Insurance__c`, `TI_Fnt_CYCFS__c`)
+- **Category:** Tooling
+- **Root cause:** `fetch_sheet.apply_picklist_values_from_g` (same-day change) made col G the picklist source whenever it was filled. On Receiving, col G holds the client's line-/comma-separated notes in `Code:Label` order, while col H holds the deployable `Label:ApiName;` list. `generate_xml._build_picklist_valueset` splits only on `;`, so each picklist would have deployed as a single malformed value. The drift check also reported 7 false picklist drifts.
+- **Fix applied:** `fetch_sheet.apply_picklist_values_from_g` keeps col H when H is filled and col G has no `;`; G is kept in `_picklistValuesG` and `_picklistSource='H'`. A `;`-separated col G still wins (per the rule).
+- **Prevention added:** `validate_sheet.py`: new `picklist.source` WARN when col G was ignored for format, and a `picklist.delim` ERROR when the picklist value has line breaks and no `;` (it would deploy as one value). Re-validated: 15 of 16 picklists now use col H. Open item: `ReceivingStatus__c` col G is `;`-separated but omits the `01`–`06` API codes held in col H; for the client to settle.
+- **Status:** Monitoring
+
+### [2026-10-06] AUTO-DRAFT: deploy start failed (exit 10)  «sig:54d7dd3b06»
+- **Error signature:** (none extracted)
+- **Command:** `sf project deploy start --manifest manifest/package.xml --target-org TI_ERPDEV01 --test-level NoTestRun --wait 60 --ignore-conflicts`
+- **Component:** CustomObjectTranslation `TI_Fnt_Deal__c-en_US` (single field label `TI_Fnt_SalesPurchasingOrganization__c`, ERPPJ-1032; from `sf-deploy/work/erppj1032_translation/`)
+- **Category:** Environment/Org (transient network)
+- **Extracted failure lines:**
+    Error (10): fetch failed
+- **Root cause:** The sf CLI's HTTP call to the org dropped before the deploy request was accepted (the agent's tool call was interrupted at the same moment). Nothing reached the org: a live retrieve right after showed the translation file unchanged (190 EN labels). The check-only run of the same package had passed.
+- **Fix applied:** None needed in the generator. Confirmed the org was untouched, then re-ran the same `deploy.py --start`; it succeeded and a live retrieve showed exactly one label added (190 → 191, no other label changed).
+- **Prevention added:** No `validate_sheet.py` guard: the sheet and metadata were valid. Rule of thumb: on `Error (10): fetch failed`, retrieve the component live first to see whether anything landed, then retry once. Never retry blind on a destructive package.
+- **Status:** Resolved
+
+### [2026-10-06] AUTO-DRAFT: deploy validate (dry-run) failed (exit 1)  «sig:60a60b057f»
+- **Error signature:** (none extracted)
+- **Command:** `sf project deploy start --manifest manifest/sie_drift_package.xml --target-org TI_ERPDEV01 --test-level NoTestRun --wait 60 --dry-run`
+- **Component:** CustomField `TI_Fnt_StandaloneIncidentalExpenses__c.TI_Fnt_ApplicableYarnItemText__c` (drift update: org Formula Text → sheet Text 255)
+- **Category:** Schema
+- **Extracted failure lines:**
+    Status: Failed
+    Component Failures [1]
+    │ CustomField │ TI_Fnt_StandaloneIncidentalExpenses__c.TI_Fnt_ApplicableYarnItemText__c │ Cannot update a field from a Formula to something else (13:13) │ 13:13       │
+- **Root cause:** Salesforce cannot convert a formula field to a non-formula field in place (mirror of the 2026-09-24 Text → Formula lesson). The drift set was dry-run as one in-place update package, so the formula flip failed the whole check-only run. The generated XML itself was correct.
+- **Fix applied:** Split the drift set. CompanyCode (length 4→10), MaterialNumber (40→18), PurchasingOrganization (Date→Text 4) deployed in place. ApplicableYarnItemText: dependency check (MetadataComponentDependency = 0, no FlexiPage on the object, layout only) → destructive delete → recreate as Text(255) + CustomObjectTranslation → FLS re-granted. Post-fix drift = 0/151. Real deploys also needed `--ignore-conflicts`: local source tracking was stale (fields last edited 2026-08-27 / 09-02, not overnight).
+- **Prevention added:** `attr_drift.py` now tags every drift entry with `action`: `create` (absent), `update` (same type, attribute-only), `recreate` (formula ↔ non-formula — never try in place), `check` (other base-type change; dry-run alone first). Build the in-place update package from `update` entries only; route `recreate` through dependency check → delete → recreate. No `validate_sheet.py` guard: the sheet is valid, the failure is org-state-dependent and belongs to drift.
+- **Status:** Resolved
+
 ### [2026-10-05] ERPPJ-1032 activation: false source-tracking conflict on a settings-only CustomObject deploy
 - **Error signature:** `Conflict │ TI_Fnt_Deal__c │ CustomObject` / `There are changes in the org that conflict with the local changes you're trying to deploy.`
 - **Command:** `sf project deploy start --manifest manifest/package.xml --target-org TI_ERPDEV01 --test-level NoTestRun --wait 60` (from `sf-deploy/work/erppj1032_activate/`)

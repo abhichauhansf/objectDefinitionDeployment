@@ -54,11 +54,13 @@ def main() -> int:
     header = [norm(c).lower() for c in grid[hidx]]
     full_col = header.index("fullname")
 
+    blocked_row_nums = {int(b.split(":", 1)[1]) for b in blocked
+                        if b.lower().startswith("row:")}
     blocked_rows = []
     for i in range(hidx + 1, len(grid)):
         cells = [norm(c) for c in grid[i]]
         full = cells[full_col] if full_col < len(cells) else ""
-        if full in blocked:
+        if (full and full in blocked) or (i + 1) in blocked_row_nums:
             blocked_rows.append(i + 1)  # 1-based
 
     print(f"tab: {args.tab} (gid {gid})")

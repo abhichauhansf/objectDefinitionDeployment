@@ -17,11 +17,12 @@ from relname import (  # noqa: E402
     save_org_relationship_names,
 )
 from numeric_size import apply_numeric_size, is_numeric_sheet_type  # noqa: E402
+from picklist_api import org_picklist_values, resolve_against_org, split_entry, split_values  # noqa: E402
 from rollup_h import parse_rollup_h, summary_operation_xml  # noqa: E402  # Updated by Divakar N — 2026-09-23
-from fetch_sheet import apply_lookup_ref_from_g  # noqa: E402  # Updated by Divakar N — 2026-10-05
-
 NS = "http://soap.sforce.com/2006/04/metadata"
 ET.register_namespace("", NS)
+# {(obj, field): {label_or_api_lower: org_api}} filled when --target-org is set.
+ORG_PICKLISTS: dict[tuple[str, str], dict[str, str]] = {}
 
 
 def qname(tag: str) -> str:
@@ -66,6 +67,25 @@ def is_falsy(value):
     """Explicit FALSE only (not blank). Lets the sheet turn requiredness OFF."""
     text = str(value or "").strip().lower()
     return text in {"false", "n", "no", "0", "×", "x", "✕", "✗"}
+
+
+_AUTONUMBER_TOKEN_RE = re.compile(r"\{(\d+)\}")
+
+
+def split_autonumber_format(value) -> tuple[str, int]:
+    """Sheet `{000010000}` → (`{000000000}`, 10000).
+
+    Salesforce only accepts zeros inside the braces; the client writes the
+    first number there, so its width is the digit count and its value is the
+    starting number (all zeros = start at 1).
+    """
+    fmt = str(value or "").strip()
+    m = _AUTONUMBER_TOKEN_RE.search(fmt)
+    if not m:
+        return fmt, 1
+    digits = m.group(1)
+    start = int(digits) or 1
+    return fmt[:m.start()] + "{" + "0" * len(digits) + "}" + fmt[m.end():], start
 
 
 def _org_object_description(row: dict) -> str:
@@ -396,6 +416,7 @@ def _build_picklist_valueset(
     restricted: bool,
     global_set: str,
     default_val: str = "",
+    org_map: dict | None = None,
 ) -> bool:
     """Populate or replace the <valueSet> element on a picklist field.
 
@@ -410,23 +431,17 @@ def _build_picklist_valueset(
         set_text(vs, "valueSetName", global_set)
         return True
 
-    # Normalize full-width JP punctuation so Japanese sheets parse correctly:
-    # full-width semicolon '；'(U+FF1B) -> ';' (entry delimiter),
-    # full-width colon     '：'(U+FF1A) -> ':' (Label:ApiName separator).
-    _JP_PUNCT = {0xFF1B: ord(";"), 0xFF1A: ord(":")}
-    norm_picklist = str(picklist_str or "").translate(_JP_PUNCT)
-    # Entries may be delimited by ';' OR by newlines (client sheets use both) —
-    # split on either so a newline-separated cell does NOT collapse into one
+    # Entries may be delimited by ';', full-width '；', OR by newlines (client
+    # sheets use all three) — a newline-separated cell must NOT collapse into one
     # giant value (that bug shipped EIRI picklists as a single '値1\n値2' value).
-    values = [e.strip() for e in re.split(r"[;\n]", norm_picklist) if e.strip()]
+    # Full-width '：' is handled by split_entry.
+    values = split_values(picklist_str)
     if not values:
         # Salesforce requires at least one <value>; skip generating this field.
         return False
     default_values = {
-        e.strip()
-        for e in re.split(r"[;\n]", str(default_val or "").translate(_JP_PUNCT))
-        if e.strip()
-    }
+        e.translate({0xFF1A: ord(":")}) for e in split_values(default_val)
+    } | set(split_values(default_val))
 
     vs = get_or_create(root, "valueSet")
     # Remove stale global reference if switching to inline
@@ -450,18 +465,11 @@ def _build_picklist_valueset(
     for v in list(vsd.findall(qname("value"))):
         vsd.remove(v)
 
-    _ESC = "\x00"  # sentinel for an escaped colon "\:" inside a label
-    for entry in values:
-        # "Label:ApiName" (value differs from label) or just "Label".
-        # A literal colon inside the LABEL can be escaped as "\:" so labels like
-        # "比率 1\:2:Ratio12" -> label "比率 1:2", api "Ratio12".
-        e = entry.replace("\\:", _ESC)
-        if ":" in e:
-            label, api = [p.strip() for p in e.split(":", 1)]
-        else:
-            label = api = e
-        label = label.replace(_ESC, ":")
-        api = api.replace(_ESC, ":")
+    resolved = resolve_against_org([split_entry(e) for e in values], org_map)
+    for label, api, src in resolved:
+        api = api or label
+        if src == "org":
+            print(f"      ℹ️  picklist label {label!r}: keeping org API {api!r}")
 
         val_el = ET.SubElement(vsd, qname("value"))
         set_text(val_el, "fullName", api)
@@ -485,11 +493,16 @@ def build_field_xml(row: dict) -> ET.Element | None:
     field_api = row.get("Field API Name", "").strip()
     raw_type = row.get("Data Type", "").strip()
     label = (row.get("Field Label") or row.get("Field Label (JA)") or "").strip()
-    # Updated by Divakar N — 2026-10-05. Blank col H on a lookup uses col G.
-    apply_lookup_ref_from_g(row)
     type_specific = str(row.get("Type Specific Value") or "").strip()
 
     sf_type, is_formula = normalize_type(raw_type)
+
+    # Updated by Divakar N — 2026-10-29. Why: CreditReportRequest
+    # TI_Fnt_Address_Full__c is a compound Address field created in Setup;
+    # validate_sheet.py blocks a new one, so an Address row is always org-owned.
+    if raw_type.lower() == "address":
+        print(f"Skipped field (Address type, created in Setup): {field_api}")
+        return None
 
     # Number/Currency/Percent (+ formula): derive Precision/Scale from col F.
     # Updated by Divakar N.
@@ -586,8 +599,9 @@ def build_field_xml(row: dict) -> ET.Element | None:
     elif sf_type == "Html":
         set_text(root, "type", "Html")
         set_text_if(root, "length", row.get("Length"))
-        # Salesforce REQUIRES visibleLines for Html (Rich Text); default blank -> 3.
-        set_text(root, "visibleLines", str(row.get("Visible Lines") or "3").strip() or "3")
+        # Salesforce REQUIRES visibleLines 10–50 for Html (Rich Text); blank -> 25,
+        # the Setup UI default.
+        set_text(root, "visibleLines", str(row.get("Visible Lines") or "25").strip() or "25")
 
     elif sf_type in ("Number", "Currency", "Percent"):
         set_text(root, "type", sf_type)
@@ -595,10 +609,8 @@ def build_field_xml(row: dict) -> ET.Element | None:
         set_text_if(root, "scale", row.get("Scale"))
 
     elif sf_type in ("Email", "Phone", "Url"):
+        # Salesforce rejects <length> on these types ("Can not specify 'length'").
         set_text(root, "type", sf_type)
-        length_val = str(row.get("Length") or "").strip()
-        if length_val:
-            set_text(root, "length", length_val)
 
     elif sf_type in ("Date", "DateTime", "Time"):
         set_text(root, "type", sf_type)
@@ -629,7 +641,10 @@ def build_field_xml(row: dict) -> ET.Element | None:
             picklist_str = ""
             print(f"  ℹ️  {field_api}: col H '{global_set}' treated as GlobalValueSet.")
         default_val = str(row.get("Default Value") or "").strip()
-        if not _build_picklist_valueset(root, picklist_str, restricted, global_set, default_val):
+        obj_api = str(row.get("Object API Name") or row.get("_SheetName") or "").strip()
+        org_map = ORG_PICKLISTS.get((obj_api, field_api))
+        if not _build_picklist_valueset(
+                root, picklist_str, restricted, global_set, default_val, org_map=org_map):
             field_api = row.get("Field API Name", "").strip()
             print(f"Skipping {field_api}: picklist has no values and no Global Value Set defined.")
             return None
@@ -716,10 +731,10 @@ def build_field_xml(row: dict) -> ET.Element | None:
 
     elif sf_type == "AutoNumber":
         set_text(root, "type", "AutoNumber")
-        display_fmt = str(row.get("Type Specific Value") or "").strip()
+        display_fmt, start_no = split_autonumber_format(row.get("Type Specific Value"))
         if display_fmt:
             set_text(root, "displayFormat", display_fmt)
-        set_text(root, "startingNumber", "1")
+        set_text(root, "startingNumber", str(start_no))
 
     elif sf_type == "EncryptedText":
         set_text(root, "type", "EncryptedText")
@@ -958,24 +973,35 @@ def _ensure_org_relationship_names(rows: list[dict], target_org: str | None,
 
 
 def main() -> None:
+    # Updated by Divakar N — 2026-10-12. Why: prep_deploy --out wrote its rows
+    # elsewhere, but this script always read temp_updates.json and generated
+    # another session's object instead of the planned one.
     import argparse
     ap = argparse.ArgumentParser(description="Sheet rows -> CustomObject/CustomField XML")
+    ap.add_argument("--in", dest="inp", default="temp_updates.json")
     ap.add_argument("--target-org", default="",
                     help="read existing relationshipNames from this org first")
     ap.add_argument("--assume-new", action="store_true",
                     help="derive blank col X without an org read (every Lookup/MD is new)")
     args = ap.parse_args()
-    input_path = Path("temp_updates.json")
+    input_path = Path(args.inp)
     if not input_path.exists():
-        print("No temp_updates.json found — skipping field XML generation.")
+        print(f"No {input_path} found — skipping field XML generation.")
         return
 
     with input_path.open("r", encoding="utf-8") as f:
         rows = json.load(f)
 
     if not rows:
-        print("No rows in temp_updates.json — nothing to generate.")
+        print(f"No rows in {input_path} — nothing to generate.")
         return
+
+    global ORG_PICKLISTS
+    if args.target_org:
+        objs = {str(r.get("Object API Name") or "").strip() for r in rows
+                if str(r.get("Object API Name") or "").strip()}
+        print(f"🔎 reading org picklist APIs for {len(objs)} object(s)…")
+        ORG_PICKLISTS = org_picklist_values(sorted(objs), args.target_org)
 
     _ensure_org_relationship_names(rows, args.target_org, args.assume_new)
     print(f"Processing {len(rows)} row(s) for custom field XML generation...")

@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """
 gen_deal_review_page.py — ERPPJ-1032: build an UNACTIVATED copy of the Deal (成約)
-record page from the customer's screen-review workbook (v2), plus a copy of the
+record page from the customer's screen-review workbook (v2.1), plus a copy of the
 Deal compact layout.
 
 Inputs
@@ -12,7 +12,7 @@ Inputs
                (Tooling CustomField, FLS-independent)
 
 What is rebuilt
-  Only the field tabs and the 合計数量・金額 section of the ``main`` region. The
+  Only the field tabs and the 明細合計 section of the ``main`` region. The
   header (highlights panel + path), the 成約明細/予定諸掛 grid tabset, the
   related-list tabset and the sidebar are kept byte-for-byte. Existing Related
   Record components (輸出入関連情報 quick actions) are MOVED from the original
@@ -89,7 +89,7 @@ SKELETON = OrderedDict([
     ])),
     ("その他", ["経営企画管理", "備考"]),
 ])
-BOTTOM_SECTION = "合計数量・金額"
+BOTTOM_SECTION = "明細合計"
 
 # AB value -> (top tab, sub tab)
 AB_ROUTE = {
@@ -335,7 +335,9 @@ class Builder:
         per = -(-len(apis) // ncols) if apis else 0
         col_items = []
         for c in range(ncols):
-            chunk = apis[c * per:(c + 1) * per] if apis else []
+            # Z-shape (row-major): 1 2 / 3 4 / 5 6 -> left col = items 1,3,5
+            # (client request, ERPPJ-1055 Ikeda 2026-10-09). Not N-shape.
+            chunk = apis[c::ncols] if apis else []
             body = self.facet([self.field(a) for a in chunk])
             col_items.append(self.component("flexipage:column", [("body", body)], "flexipage_column"))
         wrapper = self.facet(col_items)
@@ -409,7 +411,7 @@ def item_identifier(item):
     return el.text if el is not None else ""
 
 
-def build_page(orig: Path, tree, bottom, page_label, base: Path | None = None):
+def build_page(orig: Path, tree, bottom, page_label, base: Path | None = None, logistics=None):
     """Rebuild the field tabs + bottom section.
 
     ``orig`` (the live page before ERPPJ-1032) supplies the Related Record
@@ -417,6 +419,10 @@ def build_page(orig: Path, tree, bottom, page_label, base: Path | None = None):
     now in the org) supplies everything else, so edits made there in App
     Builder survive a rebuild; only main-region items carrying GEN_PREFIX
     identifiers are replaced. Without ``base`` the copy starts from ``orig``.
+
+    ``logistics`` (gen_deal_logistics_actions.py --spec) replaces the flat
+    物流情報 components on both sides with sub-tabs of Related Record
+    components, one per section.
     """
     orig_root = ET.parse(orig).getroot()
     orig_regs = regions(orig_root)
@@ -450,11 +456,25 @@ def build_page(orig: Path, tree, bottom, page_label, base: Path | None = None):
     purch["children"]["物流情報"]["visibility"] = logi_vis
 
     b = Builder(root)
-    purch["children"]["物流情報"]["components"] = [b.component(
-        "flexipage:richText",
-        [("decorate", "true"),
-         ("richTextValue", "<p>※購買側の物流情報（輸出入関連情報）の配置は別途反映予定</p>")],
-        "flexipage_richText")]
+    if logistics:
+        for top in ("販売情報", "購買情報"):
+            node = tree["children"][top]["children"]["物流情報"]
+            node["components"] = []
+            for sub, sections in logistics["tabs"][top]:
+                child = new_node()
+                child["components"] = [b.component(
+                    "console:relatedRecord",
+                    [("lookupFieldName", logistics["lookupFieldName"]),
+                     ("titleFieldName", sec),
+                     ("updateQuickActionName", action)],
+                    "console_relatedRecord") for sec, action in sections]
+                node["children"][sub] = child
+    else:
+        purch["children"]["物流情報"]["components"] = [b.component(
+            "flexipage:richText",
+            [("decorate", "true"),
+             ("richTextValue", "<p>※購買側の物流情報（輸出入関連情報）の配置は別途反映予定</p>")],
+            "flexipage_richText")]
 
     dead, keep_for_others = set(), set()
     for it in main_items:
@@ -519,13 +539,15 @@ def main() -> int:
                     help="the copy as currently in the org (retrieved). Rebuild on top of it so "
                          "App Builder edits outside the generated field tabs are kept")
     ap.add_argument("--org-fields", required=True)
+    ap.add_argument("--logistics-spec", default="",
+                    help="gen_deal_logistics_actions.py --spec output: build 物流情報 sub-tabs")
     ap.add_argument("--out-dir", default="force-app/main/default")
     ap.add_argument("--page-dev", default="TI_FnT_Deal_Lightning_Page_v2")
     ap.add_argument("--page-label", default="成約 レコードページ v2")
     ap.add_argument("--cl-dev", default="Deal_CompactLayout_v2")
     ap.add_argument("--cl-label", default="成約コンパクトレイアウト v2")
-    ap.add_argument("--cl-fields", default="Name,TI_Fnt_TradeContractDocument__c,TI_Fnt_SalesOrganization__c,"
-                                           "TI_Fnt_PurchasingOrganization__c,TI_Fnt_ContractType__c,TI_Fnt_Subject__c")
+    ap.add_argument("--cl-fields", default="Name,TI_Fnt_TradeContractDocument__c,"
+                                           "TI_Fnt_SalesPurchasingOrganization__c,TI_Fnt_ContractType__c,TI_Fnt_Subject__c")
     ap.add_argument("--dedupe", action="store_true",
                     help="place multi-placement fields at their first location only "
                          "(default: every location; the Metadata API accepts repeats)")
@@ -548,8 +570,9 @@ def main() -> int:
     for p in placements:
         place(tree, bottom, p, rep)
 
+    logistics = json.loads(Path(args.logistics_spec).read_text()) if args.logistics_spec else None
     root = build_page(Path(args.orig), tree, bottom, args.page_label,
-                      Path(args.base) if args.base else None)
+                      Path(args.base) if args.base else None, logistics)
     out = Path(args.out_dir)
     write_xml(root, out / "flexipages" / f"{args.page_dev}.flexipage-meta.xml")
 

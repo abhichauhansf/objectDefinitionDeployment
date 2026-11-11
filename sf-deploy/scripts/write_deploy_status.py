@@ -77,11 +77,8 @@ def col_letter(idx0: int) -> str:
 
 
 def write_service():
-    from googleapiclient.discovery import build
-    import google.auth
-    creds, _ = google.auth.default(
-        scopes=["https://www.googleapis.com/auth/spreadsheets"])
-    return build("sheets", "v4", credentials=creds, cache_discovery=False)
+    from google_auth import sheets_service
+    return sheets_service(write=True)
 
 
 def org_custom_fields(obj_api: str, target_org: str) -> set[str]:
@@ -206,6 +203,7 @@ def main() -> int:
             cur = g(grid[gi], c_ai)
             if cur != status and c_ai is not None:
                 data.append({"range": f"'{tab}'!{col_letter(c_ai)}{gi+1}", "values": [[status]]})
+                print(f"  {col_letter(c_ai)}{gi+1:<5} {api:42} {cur or '(blank)'!r} -> {status!r}")
         summary.append((tab, obj_api, exists, n_dep, n_not, n_std, n_del))
 
     print("=" * 70)

@@ -162,18 +162,16 @@ which strategy to use. This is the standing default (decided 2026-08-10):
         a roll-up operation/child would deploy the wrong aggregation. -->
 4. **Wire relationships** — for Lookup/MasterDetail, col H (`設定値`) is the
    lookup object (`referenceTo`).
-   <!-- Updated by Divakar N — 2026-10-05. Why: relation detail is sometimes
-        only in col G. Check G when H is blank; do not do this for formulas,
-        picklists, or roll-ups. -->
-   If col H is blank, use col G (`データ型に応じて…` / referenceTo) only when
-   G is an object API name (`User`, `Foo__c`). H wins when both are filled.
-   Write a G-sourced object API back to col H (gated). Japanese prose in G
-   is not a target and is not copied into H.
+   <!-- Updated by Divakar N — 2026-10-08. Why: the client confirmed col G is
+        a user-facing explanation the tool never reads; the 2026-10-05 col-G
+        fallback is removed. -->
+   Col G (`データ型に応じて…`) is never read. Blank H is a blocker; ask the
+   client to fill H.
    If col X (`relationshipName`) is blank, check the org first: a field that
    already exists keeps the org's relationshipName (write that back to col X,
    gated). Only for a NEW field, auto-fill X from the field API minus `__c`
    (object-scoped for shared parents User/Account/…) when the lookup object is
-   known. Only blank X **and** blank H **and** blank G is a blocker. Write the
+   known. Only blank X **and** blank H is a blocker. Write the
    derived name back to col X (gated). Use
    `fill_relationship_name.py --target-org <ORG>` for the write-back.
    <!-- Updated by Divakar N — 2026-10-06. Why: do not invent child
