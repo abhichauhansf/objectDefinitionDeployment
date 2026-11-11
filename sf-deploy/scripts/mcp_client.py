@@ -8,6 +8,7 @@ from __future__ import annotations
 
 import json
 import os
+import re
 import select
 import shlex
 import shutil
@@ -51,14 +52,15 @@ def _default_adaptor_bin() -> str:
     return found or ""
 
 
+_AUTH_FAILURE_RE = re.compile(
+    r"\b(?:unauthenticated|unauthorized|401|403|invalid_grant|not authenticated"
+    r"|please login|mcp-adaptor auth|sso|expired token|no session)\b"
+)
+
+
 def is_auth_failure(text: str) -> bool:
-    low = (text or "").lower()
-    needles = (
-        "unauthenticated", "unauthorized", "401", "403",
-        "invalid_grant", "not authenticated", "please login",
-        "mcp-adaptor auth", "sso", "expired token", "no session",
-    )
-    return any(n in low for n in needles)
+    # Whole words only: translated text such as "Promissory" contains "sso".
+    return bool(_AUTH_FAILURE_RE.search((text or "").lower()))
 
 
 class McpClient:

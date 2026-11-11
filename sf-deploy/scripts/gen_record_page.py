@@ -13,8 +13,8 @@ Output: force-app/main/default/flexipages/<PageDevName>.flexipage-meta.xml
 Each distinct AA section becomes a flexipage:fieldSection holding its fields in
 sheet order, split across TWO columns by default (per
 sf-flexipage-two-column-sections.mdc; a 1-field section stays 1 column). Uses the
-recordHomeTemplateDesktop template and the same nested-facet structure the
-existing generate_flexipage_xml.py emits.
+recordHomeTemplateDesktop template, which REQUIRES ``header``, ``main``, and
+``sidebar`` regions (a main-only page deploys but Lightning will not render it).
 """
 from __future__ import annotations
 import argparse
@@ -49,6 +49,11 @@ STANDARD_PLACEABLE = frozenset({
 STANDARD_NOT_PLACEABLE = frozenset({
     "CreatedDate", "CreatedById", "LastModifiedDate", "LastModifiedById",
 })
+# Sheet spellings of standard fields that differ from the real API name. The
+# sheet writes the relationship (``RecordType``); the placeable field is the id.
+STANDARD_ALIASES = {
+    "RecordType": "RecordTypeId",
+}
 
 
 def qn(tag: str) -> str:
@@ -85,9 +90,52 @@ def field_identifier(field_api: str, used: set) -> str:
     return cand
 
 
+def desktop_header_region() -> ET.Element:
+    """recordHomeTemplateDesktop ``header`` with a highlights panel."""
+    header = ET.Element(qn("flexiPageRegions"))
+    inst = ET.SubElement(header, qn("itemInstances"))
+    comp = ET.SubElement(inst, qn("componentInstance"))
+    for name, value in (
+        ("collapsed", "false"),
+        ("enableActionsConfiguration", "false"),
+        ("hideChatterActions", "false"),
+        ("numVisibleActions", "3"),
+    ):
+        p = ET.SubElement(comp, qn("componentInstanceProperties"))
+        st(p, "name", name)
+        st(p, "value", value)
+    st(comp, "componentName", "force:highlightsPanel")
+    st(comp, "identifier", "force_highlightsPanel")
+    st(header, "name", "header")
+    st(header, "type", "Region")
+    return header
+
+
+def desktop_sidebar_region() -> ET.Element:
+    """Empty ``sidebar`` region — required by recordHomeTemplateDesktop."""
+    sidebar = ET.Element(qn("flexiPageRegions"))
+    st(sidebar, "name", "sidebar")
+    st(sidebar, "type", "Region")
+    return sidebar
+
+
+def require_desktop_regions(root: ET.Element) -> None:
+    names = [
+        el.findtext(qn("name"))
+        for el in root.findall(qn("flexiPageRegions"))
+        if el.findtext(qn("type")) == "Region"
+    ]
+    missing = [r for r in ("header", "main", "sidebar") if r not in names]
+    if missing:
+        raise SystemExit(
+            f"recordHomeTemplateDesktop missing required regions: {missing}"
+        )
+
+
 def build(page_dev: str, master_label: str, sobject: str,
           sections: list[tuple[str, list[str]]], desired_cols: int = 1) -> ET.Element:
     root = ET.Element(qn("FlexiPage"))
+    root.append(desktop_header_region())
 
     main = ET.SubElement(root, qn("flexiPageRegions"))
     facets: list[ET.Element] = []
@@ -102,7 +150,8 @@ def build(page_dev: str, master_label: str, sobject: str,
         want = desired_cols if len(fields) > 1 else 1
         ncols = max(want, cap_cols)
         chunk = -(-len(fields) // ncols)  # balanced chunk size
-        col_chunks = [fields[i:i + chunk] for i in range(0, len(fields), chunk)] or [[]]
+        # Z-shape (row-major): left col = items 1,3,5; right col = 2,4,6 (client request)
+        col_chunks = [fields[c::ncols] for c in range(ncols)] if fields else [[]]
 
         # fieldSection component instance in the main region
         inst = ET.SubElement(main, qn("itemInstances"))
@@ -148,12 +197,27 @@ def build(page_dev: str, master_label: str, sobject: str,
     for fc in facets:
         root.append(fc)
 
+    root.append(desktop_sidebar_region())
     st(root, "masterLabel", master_label)
     st(root, "sobjectType", sobject)
     tmpl = ET.SubElement(root, qn("template"))
     st(tmpl, "name", "flexipage:recordHomeTemplateDesktop")
     st(root, "type", "RecordPage")
+    require_desktop_regions(root)
     return root
+
+
+def has_record_types(org: str, sobject: str) -> bool:
+    import subprocess
+    cp = subprocess.run(
+        ["sf", "data", "query", "--target-org", org, "--json", "--query",
+         f"SELECT COUNT() FROM RecordType WHERE SobjectType='{sobject}'"],
+        capture_output=True, text=True, timeout=120)
+    try:
+        return int(json.loads(cp.stdout)["result"]["totalSize"]) > 0
+    except (ValueError, KeyError, TypeError):
+        print(f"  ⚠️  record-type check failed for {sobject} — RecordTypeId dropped")
+        return False
 
 
 def main() -> int:
@@ -166,6 +230,8 @@ def main() -> int:
                     help="columns per section (default 2 per "
                          "sf-flexipage-two-column-sections.mdc; do not lower to 1)")
     ap.add_argument("--only", default="", help="comma-separated tabs to (re)generate")
+    ap.add_argument("--org", default="",
+                    help="org alias; RecordTypeId is placed only if the object has record types there")
     ap.add_argument("--map", default=json.dumps({
         "Deal": ["TI_Fnt_Deal__c", "成約", "Deal_Record_Page"],
         "Shipping": ["TI_Fnt_Shipping__c", "輸出・出庫管理", "Shipping_Record_Page"],
@@ -185,21 +251,35 @@ def main() -> int:
             continue
         rows = sheet.get(tab, [])
         present_set = set(present.get(tab, []))
+        keep_rt = bool(args.org) and has_record_types(args.org, sobject)
         # group fields by section in first-appearance order, keeping only
         # org-present, non-disallowed fields
         order: list[str] = []
         buckets: dict[str, list[str]] = {}
         dropped = 0
         for r in rows:
-            api = r["api"]
+            api = STANDARD_ALIASES.get(r["api"], r["api"])
             sec = r.get("section") or "(blank)"
             # never-placeable system fields (incl. audit/owner fields)
             if api in HARD_DISALLOWED or api in STANDARD_NOT_PLACEABLE:
                 dropped += 1
                 continue
-            # custom fields must actually exist in the org; standard/placeable
-            # fields (no __c) always exist, so they bypass the presence check
-            if api.endswith("__c") and api not in present_set:
+            # Record.RecordTypeId fails deploy on an object with no record types.
+            if api == "RecordTypeId" and not keep_rt:
+                print(f"  ⚠️  {tab}: RecordTypeId dropped — no record types in the org"
+                      + ("" if args.org else " (pass --org to check)"))
+                dropped += 1
+                continue
+            # custom fields must actually exist in the org; standard fields are
+            # default-deny — only the known-placeable ones go on the page, since
+            # an unlisted one deploys and then fails to render at runtime.
+            if api.endswith("__c"):
+                if api not in present_set:
+                    dropped += 1
+                    continue
+            elif api not in STANDARD_PLACEABLE:
+                print(f"  ⚠️  {tab}: standard field '{api}' is not placeable on a "
+                      f"record page — dropped")
                 dropped += 1
                 continue
             if sec not in buckets:

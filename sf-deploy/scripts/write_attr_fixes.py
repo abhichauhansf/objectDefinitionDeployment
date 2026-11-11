@@ -8,6 +8,7 @@ succeed. Per the sheet-write-confirmation rule, default is a DRY-RUN preview
 (cell: old -> new); only --apply writes.
 
 Fixes are supplied as JSON: [{"field": "<API>", "column": "<Header>", "value": "<new>"}]
+`field` may be `row:<N>` (1-based sheet row) for rows whose fullName is still blank.
 Columns are located by HEADER NAME (normalized, case-insensitive), reshuffle-proof.
 
 Usage:
@@ -20,6 +21,7 @@ from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 from fetch_sheet import get_sheets_service, find_header_row, norm  # noqa: E402
+from sheet_config import add_spreadsheet_id_arg  # noqa: E402
 
 
 def col_letter(idx0: int) -> str:
@@ -35,7 +37,7 @@ def col_letter(idx0: int) -> str:
 
 def main() -> int:
     ap = argparse.ArgumentParser()
-    ap.add_argument("--spreadsheet-id", required=True)
+    add_spreadsheet_id_arg(ap)
     ap.add_argument("--tab", required=True)
     ap.add_argument("--fixes", required=True, help="JSON [{field, column, value}]")
     ap.add_argument("--apply", action="store_true", help="write (else dry-run preview)")
@@ -69,8 +71,11 @@ def main() -> int:
         except ValueError:
             print(f"  ⚠️  column '{colname}' not found in header — skipped {field}")
             continue
-        row = row_of.get(field)
-        if not row:
+        if field.lower().startswith("row:"):
+            row = int(field.split(":", 1)[1])
+        else:
+            row = row_of.get(field)
+        if not row or row - 1 >= len(grid):
             print(f"  ⚠️  field '{field}' not found on tab — skipped")
             continue
         cell = f"{col_letter(cidx)}{row}"

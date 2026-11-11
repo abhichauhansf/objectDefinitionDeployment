@@ -22,6 +22,7 @@ import sys
 sys.path.insert(0, "scripts")
 from fetch_sheet import find_header_row, norm  # noqa: E402
 from write_back import get_write_service  # noqa: E402
+from sheet_config import add_spreadsheet_id_arg  # noqa: E402
 
 PINK = {"red": 0.98, "green": 0.75, "blue": 0.82}
 START_COL = 0   # column A ("No.", 0-based)
@@ -30,7 +31,7 @@ END_COL = 1     # column A only -> end-exclusive 1 (never the whole row)
 
 def main() -> int:
     ap = argparse.ArgumentParser()
-    ap.add_argument("--spreadsheet-id", required=True)
+    add_spreadsheet_id_arg(ap)
     ap.add_argument("--tab", required=True)
     ap.add_argument("--report", default=".build/validation_report.json")
     ap.add_argument("--apply", action="store_true")
@@ -53,11 +54,13 @@ def main() -> int:
     header = [norm(c).lower() for c in grid[hidx]]
     full_col = header.index("fullname")
 
+    blocked_row_nums = {int(b.split(":", 1)[1]) for b in blocked
+                        if b.lower().startswith("row:")}
     blocked_rows = []
     for i in range(hidx + 1, len(grid)):
         cells = [norm(c) for c in grid[i]]
         full = cells[full_col] if full_col < len(cells) else ""
-        if full in blocked:
+        if (full and full in blocked) or (i + 1) in blocked_row_nums:
             blocked_rows.append(i + 1)  # 1-based
 
     print(f"tab: {args.tab} (gid {gid})")

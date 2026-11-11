@@ -1,0 +1,19 @@
+<!-- Nested inside objects/<Obj>__c/<Obj>__c.object-meta.xml.
+     Replace <FlexiPageApiName> with the deployed FlexiPage fullName.
+     Deploy CustomObject only (not fields). Both form factors required. -->
+<actionOverrides>
+    <actionName>View</actionName>
+    <comment>Action override created by Lightning App Builder during activation.</comment>
+    <content>FlexiPageApiName</content>
+    <formFactor>Large</formFactor>
+    <skipRecordTypeSelect>false</skipRecordTypeSelect>
+    <type>Flexipage</type>
+</actionOverrides>
+<actionOverrides>
+    <actionName>View</actionName>
+    <comment>Action override created by Lightning App Builder during activation.</comment>
+    <content>FlexiPageApiName</content>
+    <formFactor>Small</formFactor>
+    <skipRecordTypeSelect>false</skipRecordTypeSelect>
+    <type>Flexipage</type>
+</actionOverrides>

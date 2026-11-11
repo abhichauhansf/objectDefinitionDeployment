@@ -1,11 +1,28 @@
 from __future__ import annotations
 import json
 import re
+import sys
 from pathlib import Path
 import xml.etree.ElementTree as ET
 
+sys.path.insert(0, str(Path(__file__).resolve().parent))
+from relname import (  # noqa: E402
+    MAX_RELATIONSHIP_NAME,
+    derive_relationship_name,
+    fetch_org_relationship_names,
+    is_standard_object,
+    org_relationship_cache_objects,
+    org_relationship_name,
+    qualify_relationship_name,
+    save_org_relationship_names,
+)
+from numeric_size import apply_numeric_size, is_numeric_sheet_type  # noqa: E402
+from picklist_api import org_picklist_values, resolve_against_org, split_entry, split_values  # noqa: E402
+from rollup_h import parse_rollup_h, summary_operation_xml  # noqa: E402  # Updated by Divakar N — 2026-09-23
 NS = "http://soap.sforce.com/2006/04/metadata"
 ET.register_namespace("", NS)
+# {(obj, field): {label_or_api_lower: org_api}} filled when --target-org is set.
+ORG_PICKLISTS: dict[tuple[str, str], dict[str, str]] = {}
 
 
 def qname(tag: str) -> str:
@@ -52,6 +69,25 @@ def is_falsy(value):
     return text in {"false", "n", "no", "0", "×", "x", "✕", "✗"}
 
 
+_AUTONUMBER_TOKEN_RE = re.compile(r"\{(\d+)\}")
+
+
+def split_autonumber_format(value) -> tuple[str, int]:
+    """Sheet `{000010000}` → (`{000000000}`, 10000).
+
+    Salesforce only accepts zeros inside the braces; the client writes the
+    first number there, so its width is the digit count and its value is the
+    starting number (all zeros = start at 1).
+    """
+    fmt = str(value or "").strip()
+    m = _AUTONUMBER_TOKEN_RE.search(fmt)
+    if not m:
+        return fmt, 1
+    digits = m.group(1)
+    start = int(digits) or 1
+    return fmt[:m.start()] + "{" + "0" * len(digits) + "}" + fmt[m.end():], start
+
+
 def _org_object_description(row: dict) -> str:
     """English org description, or Japanese — never a sheet layout note."""
     en = str(row.get("Object Description (EN)") or "").strip()
@@ -94,6 +130,9 @@ def write_object_meta(
     root = ET.Element(qname("CustomObject"))
     set_text(root, "fullName", obj_api)
     set_text(root, "label", obj_label or obj_api)
+    # Salesforce requires pluralLabel on CustomObject create; JP labels use the
+    # same string for singular and plural (no English -s inflection).
+    set_text(root, "pluralLabel", obj_label or obj_api)
     if obj_desc:
         set_text(root, "description", obj_desc)
     set_text(root, "deploymentStatus", "Deployed")
@@ -266,6 +305,7 @@ _TYPE_MAP: dict[str, str] = {
     "geolocation(latitude/longitude)": "Location",
     "rollup": "Summary",
     "rollupsummary": "Summary",
+    "roll-upsummary": "Summary",  # Updated by Divakar N — 2026-09-23
     "集計": "Summary",
 }
 
@@ -376,6 +416,7 @@ def _build_picklist_valueset(
     restricted: bool,
     global_set: str,
     default_val: str = "",
+    org_map: dict | None = None,
 ) -> bool:
     """Populate or replace the <valueSet> element on a picklist field.
 
@@ -390,23 +431,17 @@ def _build_picklist_valueset(
         set_text(vs, "valueSetName", global_set)
         return True
 
-    # Normalize full-width JP punctuation so Japanese sheets parse correctly:
-    # full-width semicolon '；'(U+FF1B) -> ';' (entry delimiter),
-    # full-width colon     '：'(U+FF1A) -> ':' (Label:ApiName separator).
-    _JP_PUNCT = {0xFF1B: ord(";"), 0xFF1A: ord(":")}
-    norm_picklist = str(picklist_str or "").translate(_JP_PUNCT)
-    # Entries may be delimited by ';' OR by newlines (client sheets use both) —
-    # split on either so a newline-separated cell does NOT collapse into one
+    # Entries may be delimited by ';', full-width '；', OR by newlines (client
+    # sheets use all three) — a newline-separated cell must NOT collapse into one
     # giant value (that bug shipped EIRI picklists as a single '値1\n値2' value).
-    values = [e.strip() for e in re.split(r"[;\n]", norm_picklist) if e.strip()]
+    # Full-width '：' is handled by split_entry.
+    values = split_values(picklist_str)
     if not values:
         # Salesforce requires at least one <value>; skip generating this field.
         return False
     default_values = {
-        e.strip()
-        for e in re.split(r"[;\n]", str(default_val or "").translate(_JP_PUNCT))
-        if e.strip()
-    }
+        e.translate({0xFF1A: ord(":")}) for e in split_values(default_val)
+    } | set(split_values(default_val))
 
     vs = get_or_create(root, "valueSet")
     # Remove stale global reference if switching to inline
@@ -430,18 +465,11 @@ def _build_picklist_valueset(
     for v in list(vsd.findall(qname("value"))):
         vsd.remove(v)
 
-    _ESC = "\x00"  # sentinel for an escaped colon "\:" inside a label
-    for entry in values:
-        # "Label:ApiName" (value differs from label) or just "Label".
-        # A literal colon inside the LABEL can be escaped as "\:" so labels like
-        # "比率 1\:2:Ratio12" -> label "比率 1:2", api "Ratio12".
-        e = entry.replace("\\:", _ESC)
-        if ":" in e:
-            label, api = [p.strip() for p in e.split(":", 1)]
-        else:
-            label = api = e
-        label = label.replace(_ESC, ":")
-        api = api.replace(_ESC, ":")
+    resolved = resolve_against_org([split_entry(e) for e in values], org_map)
+    for label, api, src in resolved:
+        api = api or label
+        if src == "org":
+            print(f"      ℹ️  picklist label {label!r}: keeping org API {api!r}")
 
         val_el = ET.SubElement(vsd, qname("value"))
         set_text(val_el, "fullName", api)
@@ -468,6 +496,19 @@ def build_field_xml(row: dict) -> ET.Element | None:
     type_specific = str(row.get("Type Specific Value") or "").strip()
 
     sf_type, is_formula = normalize_type(raw_type)
+
+    # Updated by Divakar N — 2026-10-29. Why: CreditReportRequest
+    # TI_Fnt_Address_Full__c is a compound Address field created in Setup;
+    # validate_sheet.py blocks a new one, so an Address row is always org-owned.
+    if raw_type.lower() == "address":
+        print(f"Skipped field (Address type, created in Setup): {field_api}")
+        return None
+
+    # Number/Currency/Percent (+ formula): derive Precision/Scale from col F.
+    # Updated by Divakar N.
+    if is_numeric_sheet_type(raw_type) or (
+            is_formula and sf_type in ("Number", "Currency", "Percent")):
+        apply_numeric_size(row)
 
     # Reference target (used by Lookup/MasterDetail and the required-gate below).
     ref_to_val = str(row.get("Reference To") or type_specific or "").strip()
@@ -513,6 +554,17 @@ def build_field_xml(row: dict) -> ET.Element | None:
         # fields.  The separate defaultValue column must not be used as a
         # formula fallback.
         formula_expr = type_specific
+        # Sheet formulas sometimes write Lookup__c__r; Salesforce wants Lookup__r.
+        if "__c__r" in formula_expr:
+            formula_expr = formula_expr.replace("__c__r", "__r")
+            print(f"  ⚠️  {field_api}: formula used '__c__r' — normalized to '__r'.")
+        # '"TDB"' / '"TBD"' is only legal for Formula Text. Date/Checkbox/Number
+        # placeholders must be return-type dummies or Salesforce rejects compile.
+        placeholder = formula_expr.strip().strip('"').strip("'")
+        if placeholder in {"TDB", "TBD"} and sf_type != "Text":
+            formula_expr = _DUMMY_FORMULA.get(sf_type, '"TBD"')
+            print(f"  ⚠️  {field_api}: placeholder {type_specific!r} invalid for "
+                  f"Formula {sf_type} — injected dummy {formula_expr!r}.")
         if not formula_expr:
             # A formula field CANNOT deploy with an empty formula. Inject a
             # return-type-appropriate DUMMY so the field is deployable; the real
@@ -532,7 +584,11 @@ def build_field_xml(row: dict) -> ET.Element | None:
 
     elif sf_type == "TextArea":
         set_text(root, "type", "TextArea")
-        set_text_if(root, "length", row.get("Length"))
+        # Salesforce TextArea is always 255 chars. An explicit <length> is
+        # rejected: "Can not specify 'length' for a CustomField of type TextArea".
+        if str(row.get("Length") or "").strip():
+            print(f"  ℹ️  {field_api}: TextArea length '{row.get('Length')}' omitted "
+                  "(Metadata API fixes TextArea at 255; <length> is illegal).")
 
     elif sf_type == "LongTextArea":
         set_text(root, "type", "LongTextArea")
@@ -543,8 +599,9 @@ def build_field_xml(row: dict) -> ET.Element | None:
     elif sf_type == "Html":
         set_text(root, "type", "Html")
         set_text_if(root, "length", row.get("Length"))
-        # Salesforce REQUIRES visibleLines for Html (Rich Text); default blank -> 3.
-        set_text(root, "visibleLines", str(row.get("Visible Lines") or "3").strip() or "3")
+        # Salesforce REQUIRES visibleLines 10–50 for Html (Rich Text); blank -> 25,
+        # the Setup UI default.
+        set_text(root, "visibleLines", str(row.get("Visible Lines") or "25").strip() or "25")
 
     elif sf_type in ("Number", "Currency", "Percent"):
         set_text(root, "type", sf_type)
@@ -552,10 +609,8 @@ def build_field_xml(row: dict) -> ET.Element | None:
         set_text_if(root, "scale", row.get("Scale"))
 
     elif sf_type in ("Email", "Phone", "Url"):
+        # Salesforce rejects <length> on these types ("Can not specify 'length'").
         set_text(root, "type", sf_type)
-        length_val = str(row.get("Length") or "").strip()
-        if length_val:
-            set_text(root, "length", length_val)
 
     elif sf_type in ("Date", "DateTime", "Time"):
         set_text(root, "type", sf_type)
@@ -572,8 +627,24 @@ def build_field_xml(row: dict) -> ET.Element | None:
         restricted = is_truthy(row.get("Restricted", ""))
         global_set = str(row.get("Global Value Set") or "").strip()
         picklist_str = str(row.get("Picklist Values") or type_specific or "").strip()
+        # Known GlobalValueSet DeveloperNames. A tab with no GVS column stores
+        # the set name in col H (Prefectures). Do NOT treat a one-value inline
+        # list like "Prefecture" as a GVS — that is a different field.
+        _KNOWN_GVS = {
+            "ActiveStatus", "Prefectures", "ContinentArea", "RegionArea",
+            "ParentDepartment", "infoSharingSettings", "PPMTaskStatus",
+            "CPImportance", "ExportImportIncidentalExpensesStatus",
+            "PurchaseTerm_DomesticDeliveryConditions", "Route", "SharingSetting",
+        }
+        if not global_set and picklist_str in _KNOWN_GVS:
+            global_set = picklist_str
+            picklist_str = ""
+            print(f"  ℹ️  {field_api}: col H '{global_set}' treated as GlobalValueSet.")
         default_val = str(row.get("Default Value") or "").strip()
-        if not _build_picklist_valueset(root, picklist_str, restricted, global_set, default_val):
+        obj_api = str(row.get("Object API Name") or row.get("_SheetName") or "").strip()
+        org_map = ORG_PICKLISTS.get((obj_api, field_api))
+        if not _build_picklist_valueset(
+                root, picklist_str, restricted, global_set, default_val, org_map=org_map):
             field_api = row.get("Field API Name", "").strip()
             print(f"Skipping {field_api}: picklist has no values and no Global Value Set defined.")
             return None
@@ -591,40 +662,79 @@ def build_field_xml(row: dict) -> ET.Element | None:
             set_text(root, "referenceTo", ref_to)
         rel_label = str(row.get("Relationship Label") or "").strip()
         rel_name = str(row.get("Relationship Name") or "").strip()
+        field_api = str(row.get("Field API Name") or "").strip()
+        obj_api = str(
+            row.get("Object API Name") or row.get("_SheetName") or ""
+        ).strip()
         if rel_label:
             set_text(root, "relationshipLabel", rel_label)
+        # Updated by Divakar N — 2026-10-06. Why: an existing field keeps the
+        # org's child relationship name; only new fields are derived below.
+        org_rel = org_relationship_name(obj_api, field_api)
+        if org_rel:
+            if rel_name and rel_name != org_rel:
+                print(
+                    f"  ⚠️  {obj_api}.{field_api}: col X '{rel_name}' differs from "
+                    f"org relationshipName '{org_rel}' — emitting the org value"
+                )
+            rel_name = org_rel
+            row["Relationship Name"] = rel_name
+            row["_relname_from_org"] = rel_name
+        elif not rel_name:
+            # col X blank: derive from the field API when col H has the lookup
+            # object. Shared-parent names are object-scoped (see relname.py).
+            if ref_to and field_api.endswith("__c"):
+                rel_name = derive_relationship_name(field_api, obj_api, ref_to)
+                row["Relationship Name"] = rel_name
+                row["_relname_autofilled"] = rel_name
+                print(
+                    f"  ℹ️  {obj_api}.{field_api}: blank relationshipName; "
+                    f"col H lookup '{ref_to}' → derived '{rel_name}'"
+                )
+            else:
+                print(
+                    f"⚠️  {obj_api}.{field_api}: blank 'relationshipName' for "
+                    f"a {sf_type} field and col H has no lookup object — "
+                    f"Salesforce REQUIRES this value."
+                )
+        elif len(rel_name) > MAX_RELATIONSHIP_NAME:
+            # Sheet value is illegal; do not emit it. Prefer a derived <=40 name.
+            derived = derive_relationship_name(field_api, obj_api, ref_to)
+            print(
+                f"  ⚠️  {obj_api}.{field_api}: relationshipName '{rel_name}' is "
+                f"{len(rel_name)} chars > {MAX_RELATIONSHIP_NAME}; "
+                f"using derived '{derived}'"
+            )
+            rel_name = derived
+            row["Relationship Name"] = rel_name
+            row["_relname_shortened"] = rel_name
+        # TI_Fnt_ fields on a TI_Logi_ object reuse sheet names coined for the
+        # TI_Fnt_ twin (e.g. CountryList_TINETAccount). Those collide on the
+        # parent. Qualify with Logi/Fnt/Stc before emit.
+        if (
+            rel_name
+            and not org_rel
+            and field_api.startswith("TI_Fnt_")
+            and obj_api.startswith("TI_Logi_")
+        ):
+            qualified = qualify_relationship_name(rel_name, obj_api)
+            if qualified != rel_name:
+                print(
+                    f"  ℹ️  {obj_api}.{field_api}: relationshipName "
+                    f"'{rel_name}' collides with the TI_Fnt_ twin → '{qualified}'"
+                )
+                rel_name = qualified
+                row["Relationship Name"] = rel_name
+                row["_relname_qualified"] = rel_name
         if rel_name:
             set_text(root, "relationshipName", rel_name)
-        else:
-            # Salesforce REQUIRES <relationshipName> for Lookup /
-            # MasterDetail / Hierarchy fields, and the canonical value is
-            # ALWAYS dictated by the Org (visible to Pull-from-Org as
-            # `<relationshipName>` in the field-meta XML).  Auto-deriving
-            # one (e.g. `Account__c` → `Account`) is unsafe — it collides
-            # with built-in child relationship names on standard objects
-            # and the sheet's other Lookup fields.  We surface the
-            # missing value loudly so the operator can populate column
-            # `relationshipName` from the Org instead of letting the
-            # generator invent a name.
-            field_api = str(row.get("Field API Name") or "").strip()
-            obj_api = str(
-                row.get("Object API Name") or row.get("_SheetName") or ""
-            ).strip()
-            print(
-                f"⚠️  {obj_api}.{field_api}: blank 'relationshipName' for "
-                f"a {sf_type} field. Salesforce REQUIRES this value and we "
-                f"will NOT auto-derive it (collisions are silent). Run "
-                f"'Import Selected Sheets from Org to Repo' for this object "
-                f"so the canonical relationshipName flows into the sheet, "
-                f"then re-run Push."
-            )
 
     elif sf_type == "AutoNumber":
         set_text(root, "type", "AutoNumber")
-        display_fmt = str(row.get("Type Specific Value") or "").strip()
+        display_fmt, start_no = split_autonumber_format(row.get("Type Specific Value"))
         if display_fmt:
             set_text(root, "displayFormat", display_fmt)
-        set_text(root, "startingNumber", "1")
+        set_text(root, "startingNumber", str(start_no))
 
     elif sf_type == "EncryptedText":
         set_text(root, "type", "EncryptedText")
@@ -637,7 +747,31 @@ def build_field_xml(row: dict) -> ET.Element | None:
         set_text(root, "scale", str(row.get("Scale") or "5").strip() or "5")
 
     elif sf_type == "Summary":
+        # Updated by Divakar N — 2026-09-23.
+        # Why: previously only ``<type>Summary</type>`` was written, so Salesforce
+        # rejected the field (missing summaryOperation / summaryForeignKey).
+        # Col H is the type-specific value; G is description and must not be read.
+        # Canonical H form: Operation:SUM (no space after the colon).
+        parsed = parse_rollup_h(type_specific)
+        if not parsed["ok"]:
+            print(f"Skipping {field_api}: rollup col-H parse failed — "
+                  + "; ".join(parsed["errors"]))
+            return None
         set_text(root, "type", "Summary")
+        op_xml = summary_operation_xml(parsed["operation"])
+        # WSDL SummaryOperations is lowercase count/sum/min/max.
+        set_text(root, "summaryOperation", op_xml)
+        set_text(root, "summaryForeignKey", parsed["child"])
+        if parsed["summarized_field"]:
+            set_text(root, "summarizedField", parsed["summarized_field"])
+        for item in parsed["filters"]:
+            fi = ET.SubElement(root, qname("summaryFilterItems"))
+            set_text(fi, "field", item["field"])
+            set_text(fi, "operation", item["operation"])
+            if item.get("valueField"):
+                set_text(fi, "valueField", item["valueField"])
+            else:
+                set_text(fi, "value", item.get("value", ""))
 
     else:
         # Unknown / pass-through — surface it to the deployer
@@ -725,6 +859,12 @@ def process_fields(rows: list[dict]) -> None:
         obj_api = row.get("Object API Name", "").strip()
         if not obj_api:
             continue
+        # Updated by Divakar N — 2026-09-23. Why: never emit CustomObject XML
+        # for Account/Opportunity/… — only CustomField members on that entity.
+        if is_standard_object(obj_api):
+            processed_objects.add(obj_api)
+            print(f"Skipped object metadata (standard object): {obj_api}")
+            continue
         write_object_meta(
             obj_api,
             row.get("Object Label", ""),
@@ -759,10 +899,15 @@ def process_fields(rows: list[dict]) -> None:
         if not field_api.endswith("__c"):
             continue
 
-        # Fallback: ensure object dir exists even if no object_meta row arrived
+        # Fallback: ensure object dir exists even if no object_meta row arrived.
+        # Standard objects: fields directory only — never a CustomObject stub.
+        # Updated by Divakar N — 2026-09-23.
         if obj_api not in processed_objects:
-            ensure_object_meta(obj_api, obj_label)
-            processed_objects.add(obj_api)
+            if is_standard_object(obj_api):
+                processed_objects.add(obj_api)
+            else:
+                ensure_object_meta(obj_api, obj_label)
+                processed_objects.add(obj_api)
 
         fields_dir = objects_dir / obj_api / "fields"
         fields_dir.mkdir(parents=True, exist_ok=True)
@@ -790,19 +935,75 @@ def process_fields(rows: list[dict]) -> None:
     # (b) it was a guess rather than a sourced value from the sheet.
 
 
+def _relname_org_gaps(rows: list[dict]) -> list[str]:
+    """Objects with a blank-col-X Lookup/MD row whose org relationshipNames
+    were not read, so an existing field would get an invented name."""
+    read = org_relationship_cache_objects()
+    gaps: set[str] = set()
+    for row in rows:
+        sf_type, _ = normalize_type(str(row.get("Data Type") or "").strip())
+        if sf_type not in ("Lookup", "MasterDetail"):
+            continue
+        if str(row.get("Relationship Name") or "").strip():
+            continue
+        if not str(row.get("Field API Name") or "").strip().endswith("__c"):
+            continue
+        obj = str(row.get("Object API Name") or row.get("_SheetName") or "").strip()
+        if obj and obj not in read:
+            gaps.add(obj)
+    return sorted(gaps)
+
+
+def _ensure_org_relationship_names(rows: list[dict], target_org: str | None,
+                                   assume_new: bool) -> None:
+    if target_org:
+        objs = {str(r.get("Object API Name") or r.get("_SheetName") or "").strip()
+                for r in rows}
+        rels = fetch_org_relationship_names(target_org, {o for o in objs if o})
+        if rels is None:
+            sys.exit("❌ could not read relationshipName from the org — refusing to "
+                     "derive names for fields that may already exist.")
+        save_org_relationship_names(target_org, rels)
+    gaps = _relname_org_gaps(rows)
+    if gaps and not assume_new:
+        sys.exit("❌ blank relationshipName (col X) on Lookup/Master-Detail rows of "
+                 f"{', '.join(gaps)}, but the org was not read for these objects.\n"
+                 "   Run validate_sheet.py --target-org <ORG> first, pass "
+                 "--target-org <ORG> here, or --assume-new if every such field is new.")
+
+
 def main() -> None:
-    input_path = Path("temp_updates.json")
+    # Updated by Divakar N — 2026-10-12. Why: prep_deploy --out wrote its rows
+    # elsewhere, but this script always read temp_updates.json and generated
+    # another session's object instead of the planned one.
+    import argparse
+    ap = argparse.ArgumentParser(description="Sheet rows -> CustomObject/CustomField XML")
+    ap.add_argument("--in", dest="inp", default="temp_updates.json")
+    ap.add_argument("--target-org", default="",
+                    help="read existing relationshipNames from this org first")
+    ap.add_argument("--assume-new", action="store_true",
+                    help="derive blank col X without an org read (every Lookup/MD is new)")
+    args = ap.parse_args()
+    input_path = Path(args.inp)
     if not input_path.exists():
-        print("No temp_updates.json found — skipping field XML generation.")
+        print(f"No {input_path} found — skipping field XML generation.")
         return
 
     with input_path.open("r", encoding="utf-8") as f:
         rows = json.load(f)
 
     if not rows:
-        print("No rows in temp_updates.json — nothing to generate.")
+        print(f"No rows in {input_path} — nothing to generate.")
         return
 
+    global ORG_PICKLISTS
+    if args.target_org:
+        objs = {str(r.get("Object API Name") or "").strip() for r in rows
+                if str(r.get("Object API Name") or "").strip()}
+        print(f"🔎 reading org picklist APIs for {len(objs)} object(s)…")
+        ORG_PICKLISTS = org_picklist_values(sorted(objs), args.target_org)
+
+    _ensure_org_relationship_names(rows, args.target_org, args.assume_new)
     print(f"Processing {len(rows)} row(s) for custom field XML generation...")
     process_fields(rows)
     print("Custom field XML generation complete.")

@@ -15,6 +15,7 @@ import sys
 
 sys.path.insert(0, "scripts")
 from fetch_sheet import get_sheets_service, find_header_row, norm, GRAY_GUARD_SUBSTR, is_field_list_end  # noqa: E402
+from sheet_config import add_spreadsheet_id_arg  # noqa: E402
 
 
 def col_letter(idx0: int) -> str:
@@ -30,7 +31,7 @@ def col_letter(idx0: int) -> str:
 
 def main() -> int:
     ap = argparse.ArgumentParser()
-    ap.add_argument("--spreadsheet-id", required=True)
+    add_spreadsheet_id_arg(ap)
     ap.add_argument("--tab", required=True)
     ap.add_argument("--out", default=".build/sales_deal_rows.json")
     args = ap.parse_args()

@@ -93,6 +93,19 @@ def main():
             "PermissionsViewAllRecords": a.view_all,
             "PermissionsModifyAllRecords": a.modify_all}
 
+    # Updated by Divakar N — 2026-09-23. Why: on Person-Account / FSC orgs,
+    # ObjectPermissions Read Account depends on Read Contact
+    # (FIELD_INTEGRITY_EXCEPTION). Grant Contact first when Account is in the set.
+    if "Account" in objects and "Contact" not in objects:
+        objects = ["Contact"] + list(objects)
+        inlist = ",".join(f"'{o}'" for o in objects)
+        r = soql(inst, ver, tok,
+                 "SELECT SobjectType,PermissionsRead,PermissionsCreate,PermissionsEdit,"
+                 "PermissionsDelete,PermissionsViewAllRecords,PermissionsModifyAllRecords "
+                 f"FROM ObjectPermissions WHERE ParentId='{psid}' AND SobjectType IN ({inlist})")
+        existing = {rec["SobjectType"]: rec for rec in r.get("records", [])}
+        print("  (also granting Contact — Account Read depends on Contact Read)")
+
     todo = [o for o in objects if o not in existing]
     print(f"permset={a.permset} ({psid})  objects={len(objects)}")
     print(f"  already have object perms={len(existing)}  to-insert={len(todo)}")
@@ -105,13 +118,18 @@ def main():
 
     records = [dict({"attributes": {"type": "ObjectPermissions"},
                      "ParentId": psid, "SobjectType": o}, **want) for o in todo]
+    # Contact must land before Account (same FIELD_INTEGRITY_EXCEPTION).
+    if any(r["SobjectType"] == "Contact" for r in records) and any(
+            r["SobjectType"] == "Account" for r in records):
+        records = ([r for r in records if r["SobjectType"] == "Contact"]
+                   + [r for r in records if r["SobjectType"] != "Contact"])
     ok = err = 0
-    for i in range(0, len(records), 200):
-        batch = records[i:i + 200]
+    # One-object batches so Account never races Contact in the same composite call.
+    for rec in records:
         res = api_call(inst, ver, tok, "POST", "composite/sobjects",
-                       {"allOrNone": False, "records": batch})
+                       {"allOrNone": False, "records": [rec]})
         if isinstance(res, dict) and res.get("__error__"):
-            print("  ❌ batch error:", res["__error__"][:400]); err += len(batch); continue
+            print("  ❌ batch error:", res["__error__"][:400]); err += 1; continue
         for item in res:
             if item.get("success"):
                 ok += 1

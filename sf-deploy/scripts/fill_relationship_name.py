@@ -14,8 +14,12 @@ name is OBJECT-SCOPED with a short acronym of the owning object
 (e.g. ExportControlClassification → 'ECC_SalesDeliveryInCharge'). Only rows that
 are Lookup/MD with a currently-empty relationshipName are touched.
 
-  python scripts/fill_relationship_name.py --spreadsheet-id <ID> \
-      --tab "成約:Sales_Deal" [--apply]
+Updated by Divakar N — 2026-10-06: with --target-org, a field that already
+exists in the org gets the org's relationshipName written back instead of a
+derived one. Deriving applies to new fields only.
+
+  python scripts/fill_relationship_name.py --tab "成約:Sales_Deal" \
+      --target-org <ORG> [--apply]
 """
 from __future__ import annotations
 
@@ -25,7 +29,9 @@ import sys
 
 sys.path.insert(0, "scripts")
 from fetch_sheet import find_header_row, norm  # noqa: E402
+from relname import derive_relationship_name, fetch_org_relationship_names  # noqa: E402
 from write_back import get_write_service  # noqa: E402
+from sheet_config import add_spreadsheet_id_arg  # noqa: E402
 
 
 def col_letter(i: int) -> str:
@@ -38,48 +44,34 @@ def col_letter(i: int) -> str:
     return s
 
 
-# Standard parents that accumulate child relationships from MANY objects, so a
-# bare field-derived relationshipName is collision-prone and must be scoped by
-# the owning object.
-SHARED_PARENTS = frozenset({
-    "User", "Account", "Contact", "Lead", "Group", "Case", "Opportunity",
-    "Product2", "Pricebook2", "Asset", "Campaign", "Order", "Contract",
-})
-
-
-def _obj_acronym(obj_api: str) -> str:
-    """Short token for the owning object: acronym of capitals if >=3, else a
-    trimmed component. e.g. ExportControlClassification -> 'ECC'."""
-    comp = obj_api
-    if comp.startswith("TI_Fnt_"):
-        comp = comp[len("TI_Fnt_"):]
-    if comp.endswith("__c"):
-        comp = comp[:-3]
-    caps = "".join(ch for ch in comp if ch.isupper())
-    return caps if len(caps) >= 3 else comp[:12]
-
-
 def rel_name(api: str, obj_api: str = "", parent: str = "") -> str:
-    base = api[:-3] if api.endswith("__c") else api
-    if parent in SHARED_PARENTS and obj_api:
-        # object-scope: strip our namespace from the field component, prefix acronym
-        comp = base[len("TI_Fnt_"):] if base.startswith("TI_Fnt_") else base
-        scoped = f"{_obj_acronym(obj_api)}_{comp}"
-        return scoped[:40]
-    return base
+    return derive_relationship_name(api, obj_api, parent)
 
 
 def main() -> int:
     ap = argparse.ArgumentParser()
-    ap.add_argument("--spreadsheet-id", required=True)
+    add_spreadsheet_id_arg(ap)
     ap.add_argument("--tab", required=True)
     ap.add_argument("--temp", default="temp_updates.json")
+    ap.add_argument("--target-org", default="",
+                    help="read relationshipName of fields already in this org")
     ap.add_argument("--apply", action="store_true")
     args = ap.parse_args()
 
     tu = json.load(open(args.temp, encoding="utf-8"))
     obj_api = next((r.get("Object API Name", "") for r in tu
                     if r.get("_type") == "object_meta"), "")
+    org_rels: dict[str, str] = {}
+    if args.target_org:
+        fetched = fetch_org_relationship_names(args.target_org, {obj_api})
+        if fetched is None:
+            print("❌ could not read relationshipName from the org — refusing to "
+                  "derive names for fields that may already exist.")
+            return 1
+        org_rels = {k.lower(): v for k, v in (fetched.get(obj_api) or {}).items() if v}
+    else:
+        print("⚠️  no --target-org: names are derived for every row. Pass "
+              "--target-org so existing fields get the org value.")
     # Custom lookups only — never touch standard fields (OwnerId, CreatedById…).
     lk = {r.get("Field API Name") for r in tu
           if r.get("_type") != "object_meta"
@@ -105,19 +97,24 @@ def main() -> int:
         api = cells[dcol] if dcol < len(cells) else ""
         cur = cells[rncol] if rncol < len(cells) else ""
         if api in lk and not cur:
-            targets.append((i + 1, api, rel_name(api, obj_api, parent_of.get(api, ""))))
+            org_rn = org_rels.get(api.lower())
+            if org_rn:
+                targets.append((i + 1, api, org_rn, "org"))
+            else:
+                targets.append((i + 1, api,
+                                rel_name(api, obj_api, parent_of.get(api, "")), "derived"))
 
     print(f"tab: {args.tab} | relationshipName col: {rncol_letter}")
     print(f"lookup/MD rows to fill ({len(targets)}):")
-    for r, api, rn in targets:
-        print(f"  row {r:>3} | {api:<34} -> {rn}")
+    for r, api, rn, src in targets:
+        print(f"  row {r:>3} | {api:<34} -> {rn}  ({src})")
 
     if not args.apply:
         print("DRY RUN — nothing written. Re-run with --apply.")
         return 0
 
     data = [{"range": f"'{args.tab}'!{rncol_letter}{r}", "values": [[rn]]}
-            for r, _, rn in targets]
+            for r, _, rn, _src in targets]
     resp = svc.spreadsheets().values().batchUpdate(
         spreadsheetId=args.spreadsheet_id,
         body={"valueInputOption": "RAW", "data": data}).execute()

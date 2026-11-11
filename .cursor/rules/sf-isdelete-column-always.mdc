@@ -32,7 +32,10 @@ delete-the-other.
 3. **Route deletions to the destructive DELETE set** (`build_destructive.py` →
    `destructiveChanges.xml`), handled by the destructive-deploy flow in
    `sf-deploy-delta-and-blockers.mdc` (STEP 2b). An IsDelete row is NEVER part of
-   the normal create/update field package.
+   the normal create/update field package. If the field is still placed on a
+   Lightning page, unplace it from that page first (STEP 2b §1b — the only
+   exception to the page freeze), then delete it.
+   <!-- Updated by Divakar N — 2026-10-06. -->
 4. **Never create/update an IsDelete row** — regardless of:
    - a blank API name (do NOT AI-name it, do NOT label-fallback-reuse it into the
      create set),

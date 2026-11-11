@@ -22,6 +22,7 @@ from pathlib import Path
 from typing import Any
 
 from mcp_deepl import DeepLProvider, DeepLTranslateError, DeepLUnavailable
+from relname import is_standard_object
 from secret_resolver import isolated_child_env
 from write_back import get_write_service
 
@@ -53,6 +54,7 @@ PROVIDER_SOURCE = "JA"
 PROVIDER_TARGET = "EN-US"
 
 LABEL_MAX_LEN = 40  # Custom object + custom field label limit
+OVERLENGTH_REASON = "English exceeds Salesforce label limit"
 FORMULA_ERRORS = (
     "#N/A", "#VALUE!", "#REF!", "#NAME?", "#DIV/0!", "#NULL!", "#NUM!",
     "#ERROR!", "#ERROR",
@@ -234,7 +236,7 @@ def invalid_english(
     if is_placeholder(text):
         return f"placeholder English {text!r}"
     if len(text) > LABEL_MAX_LEN:
-        return f"English exceeds Salesforce label limit ({len(text)}>{LABEL_MAX_LEN})"
+        return f"{OVERLENGTH_REASON} ({len(text)}>{LABEL_MAX_LEN})"
     api_n = norm(api)
     if api_n and text.lower() in {api_n.lower(), api_n.lower().removesuffix("__c")}:
         return "English is the API name"
@@ -244,6 +246,11 @@ def invalid_english(
             return ""
         return "English is a copy of the Japanese source"
     return ""
+
+
+def is_overlength(reason: str) -> bool:
+    """True when invalid_english() rejected the label only for its length."""
+    return (reason or "").startswith(OVERLENGTH_REASON)
 
 
 def object_en_for_org(header_en: str, name_en: str) -> tuple[str, str]:
@@ -264,6 +271,13 @@ _PLURAL_IRREGULAR = {
     "child": "children", "mouse": "mice", "goose": "geese",
     "leaf": "leaves", "life": "lives", "knife": "knives",
 }
+# Mass nouns have no plural form: "Financial Information" stays as-is.
+_PLURAL_UNCOUNTABLE = {
+    "information", "data", "equipment", "software", "hardware", "feedback",
+    "evidence", "advice", "research", "knowledge", "freight", "cargo",
+    "baggage", "luggage", "news", "staff", "personnel", "machinery",
+    "furniture", "merchandise",
+}
 _VOWELS = set("aeiou")
 
 
@@ -276,6 +290,8 @@ def _plural_word(word: str) -> str:
     if not core:
         return word
     low = core.lower()
+    if low in _PLURAL_UNCOUNTABLE:
+        return word
     irr = _PLURAL_IRREGULAR.get(low)
     if irr:
         out = irr.upper() if core.isupper() else (irr.capitalize() if core[:1].isupper() else irr)
@@ -294,9 +310,20 @@ def _plural_word(word: str) -> str:
 
 
 def _pluralize_last_token(phrase: str) -> str:
+    # A trailing qualifier in brackets is not the head noun:
+    # "Summary (Non-Consolidated)" → "Summaries (Non-Consolidated)".
+    m = re.match(r"^(.*\S)(\s*[(（][^()（）]*[)）])$", phrase)
+    if m:
+        return _pluralize_last_token(m.group(1)) + m.group(2)
     tokens = phrase.split(" ")
     tokens[-1] = _plural_word(tokens[-1])
     return " ".join(tokens)
+
+
+def ends_in_plural_word(label: str) -> bool:
+    """True when the label's last word is already plural (e.g. ``Trends``)."""
+    text = norm(label)
+    return bool(text) and _pluralize_last_token(text) == text
 
 
 def english_plural_label(singular: str) -> str:
@@ -398,7 +425,9 @@ def build_glossary(rows: list[dict]) -> dict:
             return
         if invalid_english(en_n, ja=ja, api=api):
             return
-        if api:
+        # Every object has its own Name field; its English must not be shared
+        # across tabs by API name.
+        if api and api.lower() != "name":
             by_api[api.lower()].add(en_n)
         if ja:
             by_ja[norm(ja)].add(en_n)
@@ -786,6 +815,9 @@ def read_metadata(mtype: str, full_names: list[str], tok: str, inst: str,
             body = e.read().decode("utf-8", errors="replace")
             raise SystemExit(f"❌ readMetadata {mtype} HTTP {e.code}: {body[:400]}")
         stripped = strip_soap_ns(xml)
+        # Components missing from the org come back as <records xsi:nil="true"/>;
+        # left in, the pattern below spans into the next real record and drops it.
+        stripped = re.sub(r"<records\b[^>]*/>", "", stripped)
         for m in re.finditer(r"<records\b[^>]*>.*?</records>", stripped, flags=re.DOTALL):
             frag = m.group(0)
             try:
@@ -847,6 +879,9 @@ def entries_from_rows(rows: list[dict], lang: str = SF_LANG) -> list[dict]:
             continue
         src = f"object_tab:{r.get('_SheetName') or obj}"
         if r.get("_type") == "object_meta":
+            # Standard objects keep Salesforce's own object/Name labels.
+            if is_standard_object(obj):
+                continue
             obj_en, _via = object_en_for_org(
                 r.get("Object Label (EN)"), r.get("Name Field Label (EN)"))
             if obj_en:
@@ -1143,6 +1178,8 @@ class Enrichment:
     fields_affected: int = 0
     stale: bool = False
     applied: bool = False
+    fitted: list[dict] = field(default_factory=list)
+    overlength: list[dict] = field(default_factory=list)
 
 
 class TranslationAbort(SystemExit):
@@ -1293,6 +1330,7 @@ def collect_tab(
         "tab": tab,
         "header_row": hidx + 1,
         "header_cells": header,
+        "jp_header_cells": list(grid[hidx - 1]) if hidx > 0 else [],
         "ja_col": ja_col,
         "en_col": en_col,
         "prov_col": prov_col,
@@ -1408,7 +1446,8 @@ def build_jobs(locs: list[dict], object_rows: list[dict]) -> list[dict]:
         # same header row in the Field Label (EN) column.
         ja = loc["object_ja"]["value"] or norm(meta.get("Object Label"))
         en = loc["object_en"]["value"] or norm(meta.get("Object Label (EN)"))
-        if ja:
+        std_obj = is_standard_object(obj)
+        if ja and not std_obj:
             jobs.append({
                 "kind": KIND_OBJECT_LABEL,
                 "tab": tab,
@@ -1432,7 +1471,7 @@ def build_jobs(locs: list[dict], object_rows: list[dict]) -> list[dict]:
                 "isdelete": False,
             })
         name = loc.get("name_row")
-        if name and not name["wip"]:
+        if name and not name["wip"] and not std_obj:
             jobs.append({
                 "kind": KIND_NAME_FIELD,
                 "tab": tab,
@@ -1482,11 +1521,15 @@ def enrich_jobs(
         if j.get("action") == "skip_flag":
             j["action"] = "skip"
             continue
-        # Object-header EN/provenance are never written. Over-limit header EN
-        # is resolved to Name EN only in the org package (object_en_for_org).
+        # Object-header EN is never overwritten and gets no provenance. Over-limit
+        # header EN is resolved to Name EN only in the org package
+        # (object_en_for_org). Updated by Divakar N — 2026-10-07. Why: a new
+        # object tab has no header EN at all, and --require-en then blocks the
+        # deploy; a BLANK header EN is filled once like any other label.
         if j.get("kind") == KIND_OBJECT_LABEL:
-            j["action"] = "skip"
-            continue
+            if norm(j.get("en")) or not norm(j.get("ja")) or not j.get("en_a1"):
+                j["action"] = "skip"
+                continue
         action = classify_need(j.get("ja", ""), j.get("en", ""),
                                j.get("source_hash", ""), j.get("origin", ""))
         j["action"] = action
@@ -1548,6 +1591,69 @@ def enrich_jobs(
     return jobs, blocked
 
 
+def fit_overlength_labels(
+    jobs: list[dict],
+    deepl: DeepLProvider | None,
+) -> tuple[list[dict], list[dict]]:
+    """Re-translate Name/field English over LABEL_MAX_LEN with DeepL.
+
+    Updated by Divakar N — 2026-10-07. Why: an over-long English label is not a
+    blocker. DeepL (never an LLM) re-translates it within the limit, whatever
+    provider the batch used. A label DeepL cannot fit stays on the sheet, is
+    held out of the translation package, and is reported as a WARN.
+    Object-header English is resolved by object_en_for_org instead.
+    Returns (fitted, unfitted).
+    """
+    todo = []
+    for j in jobs:
+        if j.get("kind") == KIND_OBJECT_LABEL or j.get("formula"):
+            continue
+        if j.get("wip") or j.get("isdelete") or j.get("action") in {"block", "block_blank_ja"}:
+            continue
+        en = j.get("en_new") or j.get("en") or ""
+        if en and norm(j.get("ja")) and is_overlength(
+                invalid_english(en, ja=j.get("ja", ""), api=j.get("field_api", ""))):
+            todo.append(j)
+    if not todo:
+        return [], []
+
+    own = None
+    if deepl is None:
+        own = DeepLProvider()
+        try:
+            own.preflight()
+            deepl = own
+        except DeepLUnavailable as exc:
+            own.close()
+            for j in todo:
+                j["overlength"] = f"DeepL unavailable for length fit: {exc}"
+            return [], todo
+
+    fitted, unfitted = [], []
+    ts = now_iso()
+    try:
+        for j in todo:
+            old = j.get("en_new") or j.get("en") or ""
+            en = deepl.translate_fit(j["ja"], LABEL_MAX_LEN)
+            if not en or invalid_english(en, ja=j["ja"], api=j.get("field_api", "")):
+                j["overlength"] = f"DeepL could not fit {old!r} within {LABEL_MAX_LEN} chars"
+                unfitted.append(j)
+                continue
+            j["en_new"] = en
+            j["fitted_from"] = old
+            j["origin"] = ORIGIN_DEEPL
+            j["source_hash"] = content_hash(j["ja"])
+            j["generated_at"] = ts
+            j["via"] = "deepl.fit"
+            if j.get("action") in {"skip", "provenance_backfill"}:
+                j["action"] = "translate"
+            fitted.append(j)
+    finally:
+        if own:
+            own.close()
+    return fitted, unfitted
+
+
 def jobs_to_writes(jobs: list[dict], locs_by_tab: dict[str, dict]) -> list[CellWrite]:
     writes: list[CellWrite] = []
     for j in jobs:
@@ -1575,6 +1681,8 @@ def jobs_to_writes(jobs: list[dict], locs_by_tab: dict[str, dict]) -> list[CellW
             ))
 
         if j["kind"] == KIND_OBJECT_LABEL:
+            if action == "translate" and not norm(j.get("old_en")):
+                add(j.get("en_a1"), "", en_new, "en")
             continue
 
         # Name + custom fields share the field-row columns.
@@ -1607,8 +1715,10 @@ def header_writes(locs: list[dict]) -> list[CellWrite]:
                     FIELD_EN_HEADER: "項目ラベル名 (EN)",
                     PROVENANCE_HEADER: "翻訳出典",
                 }.get(hdr, hdr)
+                jp_cells = loc.get("jp_header_cells") or []
+                jp_old = jp_cells[col] if col < len(jp_cells) else ""
                 out.append(_write(
-                    tab, a1(col, hrow - 1), "", jp, "RAW",
+                    tab, a1(col, hrow - 1), jp_old, jp, "RAW",
                     "header", hdr, "", "", note="jp-header",
                 ))
     return out
@@ -1631,6 +1741,12 @@ def preview(enr: Enrichment) -> str:
         lines.append(f"  {w.range:28}  {w.old!r:22} → {w.new!r}   [{w.mode} {w.note or w.kind}]")
     if not enr.writes:
         lines.append("  (no sheet writes — idempotent)")
+    for j in enr.fitted:
+        lines.append(f"  FIT  {j.get('object_api')}.{j.get('field_api')}: "
+                     f"{j.get('fitted_from')!r} → {j.get('en_new')!r} (DeepL, ≤{LABEL_MAX_LEN})")
+    for j in enr.overlength:
+        lines.append(f"  WARN {j.get('object_api')}.{j.get('field_api')}: {j.get('overlength')} "
+                     f"— English not deployed for this field")
     lines.append("-" * 72)
     lines.append(f"  cells: {len(enr.writes)}   translated: {enr.translated}   "
                  f"provenance backfill: {enr.backfilled}   skipped: {enr.skipped}")
@@ -1689,7 +1805,10 @@ def read_calculated(svc, sid: str, jobs: list[dict]) -> None:
         for j in group:
             calc = values.get(j["en_a1"], "")
             reason = invalid_english(calc, ja=j.get("ja", ""), api=j.get("field_api", ""))
-            if reason:
+            if is_overlength(reason):
+                # Not a blocker: held out of the package; the next run fits it with DeepL.
+                j["overlength"] = f"Google result {calc!r} is {reason}; re-run to fit with DeepL"
+            elif reason:
                 raise TranslationAbort(
                     f"⛔ calculated Google Translate result is invalid for "
                     f"{j.get('object_api')}.{j.get('field_api')}: {reason} "
@@ -1745,6 +1864,9 @@ def merge_into_rows(rows: list[dict], jobs: list[dict]) -> list[dict]:
             n = by_obj_field.get((obj, "Name", KIND_NAME_FIELD))
             if n and n.get("en_new"):
                 r["Name Field Label (EN)"] = n["en_new"]
+            o = by_obj_field.get((obj, obj, KIND_OBJECT_LABEL))
+            if o and o.get("en_new") and not norm(r.get("Object Label (EN)")):
+                r["Object Label (EN)"] = o["en_new"]
             continue
         api = norm(r.get("Field API Name"))
         j = by_obj_field.get((obj, api, KIND_OBJECT_FIELD))
@@ -1804,7 +1926,9 @@ def run_enrichment(
     # Provider preflight only if at least one label will need a provider.
     probe = []
     for j in jobs:
-        if j.get("action") == "skip_flag" or j.get("kind") == KIND_OBJECT_LABEL:
+        if j.get("action") == "skip_flag":
+            continue
+        if j.get("kind") == KIND_OBJECT_LABEL and (norm(j.get("en")) or not j.get("en_a1")):
             continue
         act = classify_need(j.get("ja", ""), j.get("en", ""),
                             j.get("source_hash", ""), j.get("origin", ""))
@@ -1827,6 +1951,7 @@ def run_enrichment(
             else ORIGIN_GOOGLE, deepl,
         )
         fill_org_object_descriptions(object_rows, rows, enr.provider, deepl)
+        enr.fitted, enr.overlength = fit_overlength_labels(jobs, deepl)
     except DeepLTranslateError as e:
         if deepl:
             deepl.close()

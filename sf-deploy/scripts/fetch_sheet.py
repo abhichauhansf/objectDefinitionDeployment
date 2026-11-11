@@ -5,14 +5,15 @@ from a Google Sheet into `temp_updates.json` (the exact shape the existing
 `generate_xml.py` generator expects).
 
 Replaces the CI-only inline `fetch_data.js`. Runs fully locally using the
-user's Google credentials:
-  1. Application Default Credentials (ADC)  — `gcloud auth application-default
-     login --scopes=...spreadsheets,drive`  (preferred, deploys as the user), OR
-  2. a service-account JSON via GOOGLE_SERVICE_ACCOUNT_JSON.
+user's Google credentials via `google_auth.py`:
+  1. a service-account JSON via GOOGLE_SERVICE_ACCOUNT_JSON, OR
+  2. Application Default Credentials. If they are missing or expired,
+     google_auth.py runs `gcloud auth login --enable-gdrive-access --update-adc`
+     (browser sign-in) and continues.
 
 Usage:
   python scripts/fetch_sheet.py \
-      --spreadsheet-id <ID> \
+      [--spreadsheet-id <ID>]          # default: scripts/sheet_config.py
       [--tabs "成約,輸入・入庫管理明細"]   # default: every object tab (auto-detected)
       [--out temp_updates.json]
 
@@ -29,8 +30,13 @@ from __future__ import annotations
 import argparse
 import json
 import os
+import re
 import sys
 import warnings
+
+from sheet_config import add_spreadsheet_id_arg
+from numeric_size import apply_numeric_size, is_numeric_sheet_type, numeric_size_mode_banner
+from rollup_h import apply_rollup_h, is_summary_type  # Updated by Divakar N — 2026-09-23
 
 warnings.filterwarnings("ignore")
 
@@ -69,6 +75,15 @@ API_HEADER_TO_KEY = {
 # so it follows the column regardless of its physical letter).
 COL_H_PREFIX = "displayformat"  # "displayFormat / referenceTo / formula / valueSet"
 COL_H_KEY = "Type Specific Value"
+# Col G (データ型に応じて…). Description for every type except Lookup /
+# Master-Detail, where it is the referenceTo fallback when col H is blank.
+# Updated by Divakar N — 2026-10-05.
+COL_G_KEY = "Type Specific Note"
+_LOOKUP_REF_TYPES = {
+    "lookup", "masterdetail", "hierarchy", "参照関係", "主従関係",
+}
+# Object API only (User, Account, Foo__c). Japanese prose in col G is not a target.
+_OBJECT_API_RE = re.compile(r"^[A-Za-z][A-Za-z0-9_]*$")
 
 # Tabs that are never object metadata sheets.
 NON_OBJECT_TABS = {
@@ -146,34 +161,75 @@ def find_helper_cols(header_row: list) -> dict:
 
 
 def get_sheets_service():
-    """Build a Sheets API client from ADC or a service-account JSON."""
-    from googleapiclient.discovery import build
+    """Read-only Sheets client; re-runs the gcloud login if credentials expired."""
+    from google_auth import sheets_service
 
-    scopes = [
-        "https://www.googleapis.com/auth/spreadsheets.readonly",
-        "https://www.googleapis.com/auth/drive.readonly",
-    ]
-    sa_raw = os.environ.get("GOOGLE_SERVICE_ACCOUNT_JSON", "").strip()
-    if sa_raw:
-        import base64
-        from google.oauth2 import service_account
-
-        if sa_raw.startswith("{"):
-            info = json.loads(sa_raw)
-        elif sa_raw.startswith("/") or sa_raw.lower().endswith(".json"):
-            info = json.load(open(sa_raw))
-        else:
-            info = json.loads(base64.b64decode(sa_raw).decode())
-        creds = service_account.Credentials.from_service_account_info(info, scopes=scopes)
-    else:
-        import google.auth
-
-        creds, _ = google.auth.default(scopes=scopes)
-    return build("sheets", "v4", credentials=creds, cache_discovery=False)
+    return sheets_service()
 
 
 def norm(s) -> str:
     return str(s or "").strip()
+
+
+_PICKLIST_TYPES = {
+    "picklist", "multiselectpicklist", "multipicklist", "選択リスト", "選択リスト(複数選択)",
+}
+
+
+# Updated by Divakar N — 2026-10-19. Why: the client writes
+# "グローバル選択リスト：承認ステータス" in col H to mean "use the global value set";
+# it was parsed as one inline value. Map the set's label to its DeveloperName.
+GVS_REF_PREFIX = "グローバル選択リスト"
+GVS_BY_LABEL = {
+    "承認ステータス": "ApprovalStatus",
+}
+_GVS_API_RE = re.compile(r"^[A-Za-z][A-Za-z0-9_]*$")
+
+
+def apply_global_value_set_ref(rec: dict) -> bool:
+    """Col H ``グローバル選択リスト：<label>`` → ``Global Value Set`` = DeveloperName.
+
+    An unknown label is kept in ``_gvsUnresolved`` so the validator can block it.
+    Returns True when H was a global-value-set reference.
+    """
+    h = norm(rec.get(COL_H_KEY))
+    if not h.startswith(GVS_REF_PREFIX):
+        return False
+    ref = h[len(GVS_REF_PREFIX):].lstrip("：: \u3000").strip()
+    name = GVS_BY_LABEL.get(ref) or (ref if _GVS_API_RE.match(ref) else "")
+    rec[COL_H_KEY] = ""
+    if name:
+        rec["Global Value Set"] = name
+    else:
+        rec["_gvsUnresolved"] = ref
+    return True
+
+
+def apply_picklist_values_from_g(rec: dict) -> bool:
+    """Picklist: col H (``value``) holds the values; blank H falls back to col G.
+
+    Updated by Divakar N — 2026-10-08.
+    Why: agreed with Yagai-san. Col H (header renamed ``value``) carries the
+    deployable ``Label:ApiName;`` list and col L is the default value. Col G is
+    the customer view (labels only). When H is filled it is used as-is and G is
+    ignored. When H is blank, the labels are read from G; ``picklist_api.py``
+    generates the English API names and the result is written to col H (gated),
+    so H is always the source after the first deploy.
+
+    Returns True when the values were taken from G.
+    """
+    raw = norm(rec.get("Data Type")).lower().replace(" ", "").replace("_", "").replace("-", "")
+    if raw not in _PICKLIST_TYPES:
+        return False
+    rec["_picklistSource"] = "H"
+    if apply_global_value_set_ref(rec):
+        return False
+    g = norm(rec.get(COL_G_KEY))
+    if not g or norm(rec.get(COL_H_KEY)):
+        return False
+    rec[COL_H_KEY] = g
+    rec["_picklistSource"] = "G"
+    return True
 
 
 def is_object_tab(title: str) -> bool:
@@ -215,7 +271,9 @@ def build_col_map(header_row: list, jp_header_row: list | None = None) -> dict[i
     The client "Format" sheet has TWO polymorphic value columns whose machine
     API-header row is ambiguous — it carries ``defaultValue`` on BOTH the
     ``数式(設定値)`` column (the REAL type-specific value: formula body /
-    picklist values / referenceTo / displayFormat) AND the ``デフォルト値``
+    picklist values / referenceTo / displayFormat / roll-up setup
+    — Updated by Divakar N, 2026-09-23: H is also the Rollup summary block)
+    AND the ``デフォルト値``
     column (the real field default). It also carries
     ``displayFormat / referenceTo / formula / valueSet`` on the
     ``データ型に応じて…`` column, which in this sheet is only a human DESCRIPTION
@@ -227,8 +285,10 @@ def build_col_map(header_row: list, jp_header_row: list | None = None) -> dict[i
     mislabels G, we disambiguate by the UNIQUE Japanese header substrings:
       * ``設定値`` → ``数式(設定値)`` (col H)  → Type Specific Value
       * ``デフォルト`` → ``デフォルト値`` (col L) → Default Value
-    The ``データ型に応じて…`` column (col G) is a description → NOT read
-    (no fall back to G when H is blank; a blank H is surfaced as a blocker).
+    The ``データ型に応じて…`` column (col G) is a user-facing description and
+    is never read as configuration. Updated by Divakar N — 2026-10-08: the
+    2026-10-05 Lookup col-G fallback is removed (client confirmed G is not
+    referred to by the tool).
     """
     col_map: dict[int, str] = {}
     jp = [norm(c) for c in (jp_header_row or [])]
@@ -257,10 +317,11 @@ def build_col_map(header_row: list, jp_header_row: list | None = None) -> dict[i
                  "translation generated at"):
             col_map[idx] = API_HEADER_TO_KEY[h]
             continue
-        # 2) The 'displayFormat/referenceTo/formula/valueSet' header sits on the
-        #    DESCRIPTION column (col G) in this sheet — do NOT read it as the
-        #    value (client's real value is col H, handled above).
-        if h.startswith(COL_H_PREFIX):
+        # 2) Col G (displayFormat / referenceTo / …, JP データ型に応じて…).
+        #    Stored separately. Lookup / Master-Detail copy it into the value
+        #    only when col H is blank. Updated by Divakar N — 2026-10-05.
+        if h.startswith(COL_H_PREFIX) or "データ型に応じて" in jph:
+            col_map[idx] = COL_G_KEY
             continue
         # 3) Everything else maps by the English API header.
         if h in API_HEADER_TO_KEY:
@@ -296,7 +357,7 @@ def parse_object_header(grid: list[list], header_idx: int) -> dict:
     """
     meta = {"_type": "object_meta"}
     label = api = desc = ""
-    er = ea = eh = es = ""
+    er = ea = eh = es = ct = ""
     # Object-meta only: stop before the JP field-header row so field-column
     # labels (翻訳出典, 項目ラベル名 (EN)) are never read as object EN/provenance.
     meta_end = max(header_idx - 1, 0)
@@ -346,6 +407,12 @@ def parse_object_header(grid: list[list], header_idx: int) -> dict:
                         eh = v
                     elif key == "es":
                         es = v
+            # Updated by Divakar N — 2026-10-12. Why: the Create Tab flag was
+            # never parsed, and its column differs by tab (G6 on
+            # ExportLetterOfCreditInfo, H6 on others), so a TRUE flag went unseen.
+            ci = next((i for i, c in enumerate(labelrow) if c.startswith("タブ作成")), None)
+            if ci is not None:
+                ct = vals[ci] if ci < len(vals) else ""
     meta.update({
         "Object Label": label,
         "Object API Name": api,
@@ -354,6 +421,7 @@ def parse_object_header(grid: list[list], header_idx: int) -> dict:
         "enableActivities": ea,
         "enableHistory": eh,
         "enableSearch": es,
+        "createTab": ct,
     })
     unpack_packed(
         meta,
@@ -407,6 +475,8 @@ def parse_tab(title: str, grid: list[list], object_api_hint: str = "") -> list[d
     name_field = {}
     wip_skipped = 0
     delete_skipped = 0
+    numeric_from_f = 0
+    rollup_parsed = 0
 
     def cell_at(cells, key):
         idx = helper[key]
@@ -445,6 +515,8 @@ def parse_tab(title: str, grid: list[list], object_api_hint: str = "") -> list[d
         if cell_at(cells, "isdelete").lower() in DELETE_TRUE:
             delete_skipped += 1
             continue
+        # Picklist: col H holds the values; blank H reads the labels from col G.
+        apply_picklist_values_from_g(rec)
         # capture Name field for the object's <nameField>
         if norm(rec.get("Field API Name")) == "Name":
             name_field = {
@@ -458,6 +530,20 @@ def parse_tab(title: str, grid: list[list], object_api_hint: str = "") -> list[d
                 "Name Translation Generated At": rec.get("Translation Generated At", ""),
             }
             continue
+        # Number/Currency/Percent: derive Precision/Scale from col F ("12, 3")
+        # so T/U are not required from the client (in-memory only; not a sheet write).
+        if is_numeric_sheet_type(rec.get("Data Type")):
+            st = apply_numeric_size(rec)
+            if st.get("ok") and st.get("source") == "F":
+                numeric_from_f += 1
+        # Updated by Divakar N — 2026-09-23.
+        # Why: Rollup summary setup is in col H (設定値), not G. Parse
+        # Operation:COUNT / Child:… / Field:… / Condition:… (no space after colon)
+        # here so generate/validate see it.
+        # Blank/unparseable H is a validator ERROR (no dummy, unlike formulas).
+        if is_summary_type(rec.get("Data Type")):
+            apply_rollup_h(rec)
+            rollup_parsed += 1
         field_rows.append(rec)
 
     obj_meta.update(name_field)
@@ -469,7 +555,9 @@ def parse_tab(title: str, grid: list[list], object_api_hint: str = "") -> list[d
     rows.extend(field_rows)
     wip_note = f", {wip_skipped} WIP(AE) skipped" if wip_skipped else ""
     del_note = f", {delete_skipped} IsDelete(AD) excluded" if delete_skipped else ""
-    print(f"  ✓ {title}: {len(field_rows)} field(s){wip_note}{del_note}, object_api='{obj_api or '?'}'")
+    f_note = f", {numeric_from_f} numeric size(s) from col F" if numeric_from_f else ""
+    ru_note = f", {rollup_parsed} rollup(s) from col H" if rollup_parsed else ""
+    print(f"  ✓ {title}: {len(field_rows)} field(s){wip_note}{del_note}{f_note}{ru_note}, object_api='{obj_api or '?'}'")
     return rows
 
 
@@ -493,12 +581,14 @@ def load_object_index(svc, spreadsheet_id: str) -> dict[str, str]:
 
 def main() -> int:
     ap = argparse.ArgumentParser(description="Fetch DD object tabs -> temp_updates.json")
-    ap.add_argument("--spreadsheet-id", required=True)
+    add_spreadsheet_id_arg(ap)
     ap.add_argument("--tabs", default="", help="comma-separated tab names; default=all object tabs")
     ap.add_argument("--list-tabs", action="store_true",
                     help="list the available object tabs and exit (scope-selection gate)")
     ap.add_argument("--out", default="temp_updates.json")
     args = ap.parse_args()
+
+    numeric_size_mode_banner()
 
     svc = get_sheets_service()
     meta = svc.spreadsheets().get(spreadsheetId=args.spreadsheet_id,

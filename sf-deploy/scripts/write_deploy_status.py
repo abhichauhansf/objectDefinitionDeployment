@@ -40,6 +40,7 @@ from fetch_sheet import (  # noqa: E402
     norm, GRAY_GUARD_SUBSTR, is_field_list_end, WIP_TRUE, is_object_tab, load_object_index,
     parse_object_header,
 )
+from sheet_config import add_spreadsheet_id_arg  # noqa: E402
 
 AH_HEADER_NEW = "GDC AI Tool Comments"
 AI_HEADER_NEW = "Deployment Status"
@@ -76,11 +77,8 @@ def col_letter(idx0: int) -> str:
 
 
 def write_service():
-    from googleapiclient.discovery import build
-    import google.auth
-    creds, _ = google.auth.default(
-        scopes=["https://www.googleapis.com/auth/spreadsheets"])
-    return build("sheets", "v4", credentials=creds, cache_discovery=False)
+    from google_auth import sheets_service
+    return sheets_service(write=True)
 
 
 def org_custom_fields(obj_api: str, target_org: str) -> set[str]:
@@ -115,7 +113,7 @@ def obj_exists(obj_api: str, target_org: str) -> bool:
 
 def main() -> int:
     ap = argparse.ArgumentParser(description="Fill AI deploy-status column + rename AH/AI headers")
-    ap.add_argument("--spreadsheet-id", required=True)
+    add_spreadsheet_id_arg(ap)
     ap.add_argument("--tabs", default="", help="comma-separated object tabs; default=all")
     ap.add_argument("--target-org", required=True)
     ap.add_argument("--set-headers", action="store_true",
@@ -205,6 +203,7 @@ def main() -> int:
             cur = g(grid[gi], c_ai)
             if cur != status and c_ai is not None:
                 data.append({"range": f"'{tab}'!{col_letter(c_ai)}{gi+1}", "values": [[status]]})
+                print(f"  {col_letter(c_ai)}{gi+1:<5} {api:42} {cur or '(blank)'!r} -> {status!r}")
         summary.append((tab, obj_api, exists, n_dep, n_not, n_std, n_del))
 
     print("=" * 70)

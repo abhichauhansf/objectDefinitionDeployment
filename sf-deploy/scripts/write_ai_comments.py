@@ -35,6 +35,7 @@ import sys
 
 sys.path.insert(0, "scripts")
 from fetch_sheet import find_header_row, norm, GRAY_GUARD_SUBSTR, is_field_list_end  # noqa: E402
+from sheet_config import add_spreadsheet_id_arg  # noqa: E402
 
 # Client renamed AH header FreeColumnGDC1 -> "GDC AI Tool Comments"; match the new
 # name first, keep the old one for backwards compatibility.
@@ -45,10 +46,8 @@ WIP_TRUE = {"x", "true", "1", "yes", "○", "〇"}
 
 
 def get_write_service():
-    from googleapiclient.discovery import build
-    import google.auth
-    creds, _ = google.auth.default(scopes=["https://www.googleapis.com/auth/spreadsheets"])
-    return build("sheets", "v4", credentials=creds, cache_discovery=False)
+    from google_auth import sheets_service
+    return sheets_service(write=True)
 
 
 def col_letter(idx0: int) -> str:
@@ -106,7 +105,12 @@ def build_comment_map(rows: list[dict], report: dict | None,
     per_row: dict[int, list[str]] = {}
 
     def candidates(field_token: str) -> list[dict]:
-        """Rows whose fullName == token, else blank-fullName rows whose label == token."""
+        """`row:<N>` → that sheet row; else rows whose fullName == token, else
+        blank-fullName rows whose label == token (labels can repeat, so use
+        `row:<N>` for blank-API rows with duplicate labels)."""
+        if field_token.lower().startswith("row:"):
+            n = int(field_token.split(":", 1)[1])
+            return [r for r in rows if r["row"] == n]
         exact = [r for r in rows if r["full"] and r["full"] == field_token]
         if exact:
             return exact
@@ -145,7 +149,7 @@ def build_comment_map(rows: list[dict], report: dict | None,
 
 def main() -> int:
     ap = argparse.ArgumentParser(description="Write AI review comments into AH (FreeColumnGDC1)")
-    ap.add_argument("--spreadsheet-id", required=True)
+    add_spreadsheet_id_arg(ap)
     ap.add_argument("--tab", required=True)
     ap.add_argument("--report", default="", help="validate_sheet.py --json output")
     ap.add_argument("--object", default="", help="only use report items for this object API (e.g. TI_Fnt_Shipping__c)")

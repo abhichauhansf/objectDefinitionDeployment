@@ -23,6 +23,7 @@ import sys
 sys.path.insert(0, "scripts")
 from fetch_sheet import find_header_row, norm  # noqa: E402
 from write_back import get_write_service  # noqa: E402
+from sheet_config import add_spreadsheet_id_arg  # noqa: E402
 
 
 def col_letter(i: int) -> str:
@@ -37,7 +38,7 @@ def col_letter(i: int) -> str:
 
 def main() -> int:
     ap = argparse.ArgumentParser()
-    ap.add_argument("--spreadsheet-id", required=True)
+    add_spreadsheet_id_arg(ap)
     ap.add_argument("--tab", required=True)
     ap.add_argument("--report", default=".build/validation_report.json")
     ap.add_argument("--temp", default="temp_updates.json")

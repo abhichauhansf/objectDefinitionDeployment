@@ -1,0 +1,32 @@
+---
+description: Default Google Sheet for all live reads and pipeline scripts. The spreadsheet ID lives in ONE file — sf-deploy/scripts/sheet_config.py.
+alwaysApply: true
+---
+
+# Default Google Sheet (single source of truth)
+
+Unless the user pastes a **different** spreadsheet URL, always read and write
+this project's Google Sheet.
+
+## Where to change the sheet (ONE file)
+
+Edit **`sf-deploy/scripts/sheet_config.py`** → `DEFAULT_SPREADSHEET_ID`.
+
+That is the only place that stores the ID. Pipeline scripts default to it.
+Do **not** paste a new ID into rules, skills, or other scripts.
+
+Also update `DEFAULT_SPREADSHEET_TITLE` in the same file if the workbook name
+changed.
+
+## Required behavior
+
+1. When the user says "the sheet" / "read the sheet" / fetch / validate / deploy
+   without a URL, read `sheet_config.py` and use `DEFAULT_SPREADSHEET_ID`.
+2. Use that ID for Google Workspace MCP (`get_spreadsheet_info`,
+   `read_sheet_values`) and for all `sf-deploy/scripts/*.py` calls.
+3. `--spreadsheet-id` / `--sheet-id` is **optional**. Omit it to use the default.
+4. If the user pastes a different spreadsheet URL, use that URL for **this task
+   only**. Do not change `sheet_config.py` unless they ask to make it the new
+   default.
+5. Tab scope is unchanged: still confirm which object tab(s) before fetching
+   when the target is ambiguous.

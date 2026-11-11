@@ -9,6 +9,7 @@ A failure AFTER a successful preflight is fatal — no Google fallback.
 """
 from __future__ import annotations
 
+import unicodedata
 from typing import Any
 
 from mcp_client import (
@@ -94,12 +95,37 @@ def _lang_value(key: str, spec: dict, iso: str, deepl: str) -> str:
     return deepl
 
 
-def translate_args(text: str, tool: dict | None = None) -> dict:
+# Updated by Divakar N — 2026-10-07. Why: a plain DeepL/Google translation can
+# exceed the 40-char Salesforce label limit. Over-long English is not a blocker:
+# DeepL re-translates with these escalating length instructions (no LLM).
+FIT_ATTEMPTS: tuple[tuple[str, tuple[str, ...]], ...] = (
+    ("Short field label in a Salesforce business application.",
+     ("Translate as a concise field label of at most {n} characters.",
+      "Use title case and no trailing period.")),
+    ("Short field label in a Salesforce business application.",
+     ("The result must be {n} characters or fewer including spaces.",
+      "Prefer short words and common abbreviations; drop articles and filler words.",
+      "Use title case and no trailing period.")),
+    ("Column header in a narrow table. Space is very limited.",
+     ("Output at most {n} characters including spaces; this limit is mandatory.",
+      "Use abbreviations such as Info, Desc, Org, Entity, Corp where needed.",
+      "Omit words like 'for', 'by', 'the', 'of'.",
+      "Use title case and no trailing period.")),
+)
+# Updated by Divakar N — 2026-10-14. Why: DeepL output varies per call; one
+# pass over FIT_ATTEMPTS gave up on 減価償却費（含特償） although the first
+# prompt fits it in most calls. Repeat the attempts before reporting unfitted.
+FIT_ROUNDS = 3
+
+
+def translate_args(text: str, tool: dict | None = None,
+                   extra: dict | None = None) -> dict:
     """Build tool arguments from tools/list inputSchema only.
 
     Official deepl-mcp-server (translate-text) wants sourceLangCode /
     targetLangCode with ISO-639 values (ja / en-US). Extra shotgun keys
-    are rejected when additionalProperties is false.
+    are rejected when additionalProperties is false, so `extra` keys are
+    sent only when the schema declares them.
     """
     schema = _input_schema(tool)
     props = schema.get("properties") or {}
@@ -131,6 +157,9 @@ def translate_args(text: str, tool: dict | None = None) -> dict:
                 spec = props[k] if isinstance(props[k], dict) else {}
                 args[k] = _lang_value(k, spec, iso, deepl)
                 break
+    for k, v in (extra or {}).items():
+        if k in props:
+            args[k] = v
     missing = [str(k) for k in schema.get("required") or [] if k not in args]
     if missing:
         raise DeepLUnavailable(
@@ -217,6 +246,39 @@ class DeepLProvider:
                 f"DeepL returned {len(out)} results for {len(texts)} sources"
             )
         return out
+
+    def can_fit(self) -> bool:
+        props = (_input_schema(self._tool_meta).get("properties") or {})
+        return "customInstructions" in props or "context" in props
+
+    def translate_fit(self, text: str, max_len: int) -> str:
+        """Re-translate JA→EN-US within max_len chars; '' when DeepL cannot fit it."""
+        if not self._healthy or not self._client or not self._tool:
+            raise DeepLTranslateError(
+                "DeepL translate_fit called before a successful preflight"
+            )
+        if not self.can_fit():
+            return ""
+        sources = [text]
+        half = unicodedata.normalize("NFKC", text)
+        if half != text:
+            sources.append(half)
+        for _ in range(FIT_ROUNDS):
+            for src in sources:
+                for context, instructions in FIT_ATTEMPTS:
+                    extra = {
+                        "context": context,
+                        "customInstructions": [i.format(n=max_len) for i in instructions],
+                    }
+                    try:
+                        raw = self._client.call_tool(
+                            self._tool, translate_args(src, self._tool_meta, extra))
+                    except (McpError, McpAuthError, McpUnavailable) as e:
+                        raise DeepLTranslateError(f"DeepL length-fit failed: {e}") from e
+                    en = _extract_text(raw).strip().rstrip(".")
+                    if en and len(en) <= max_len:
+                        return en
+        return ""
 
     def _translate_one(self, text: str) -> str:
         assert self._client is not None

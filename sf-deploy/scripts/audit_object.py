@@ -20,8 +20,8 @@ from pathlib import Path
 sys.path.insert(0, "scripts")
 import audit_lib as A
 from attr_drift import map_dt
-
-SID_DEFAULT = "1_TaxDe-Qxl8BAUmuZc01vUoxpBEPxJ4Opx4tEe8ulNQ"
+from numeric_size import apply_numeric_size
+from sheet_config import add_spreadsheet_id_arg
 
 
 def _num(v):
@@ -69,7 +69,8 @@ def compare_field(r: dict, om: dict) -> list[str]:
         sl, ol = _num(r.get("Length")), _num(om.get("length"))
         if sl is not None and ol is not None and sl != ol:
             why.append(f"length: sheet={sl} org={ol}")
-    if exp_base in ("Number", "Currency", "Percent") and not exp_formula:
+    if exp_base in ("Number", "Currency", "Percent"):
+        apply_numeric_size(r)
         sp, op = _num(r.get("Precision")), _num(om.get("precision"))
         ssc, osc = _num(r.get("Scale")), _num(om.get("scale"))
         if sp is not None and op is not None and sp != op:
@@ -91,7 +92,7 @@ def main() -> int:
     ap = argparse.ArgumentParser()
     ap.add_argument("--object", required=True)
     ap.add_argument("--tab", required=True)
-    ap.add_argument("--spreadsheet-id", default=SID_DEFAULT)
+    add_spreadsheet_id_arg(ap)
     ap.add_argument("--n", type=int, default=10)
     ap.add_argument("--seed", type=int, default=42)
     ap.add_argument("--flexipage", default="")

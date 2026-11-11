@@ -2,22 +2,16 @@
 """Audit Deal-tab revision changes (net oldest->newest) and confirm org parity."""
 import sys, os, json, base64, io, urllib.request
 sys.path.insert(0, "scripts")
+from sheet_config import DEFAULT_SPREADSHEET_ID as SID
 from googleapiclient.discovery import build
-from google.oauth2 import service_account
 from google.auth.transport.requests import Request
-import google.auth
+from google_auth import get_credentials
 import openpyxl
 
-SID = "1_TaxDe-Qxl8BAUmuZc01vUoxpBEPxJ4Opx4tEe8ulNQ"
 XLSX = "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
 scopes = ["https://www.googleapis.com/auth/drive.readonly"]
 
-sa = os.environ.get("GOOGLE_SERVICE_ACCOUNT_JSON", "").strip()
-if sa:
-    info = json.loads(sa) if sa.startswith("{") else (json.load(open(sa)) if (sa.startswith("/") or sa.lower().endswith(".json")) else json.loads(base64.b64decode(sa)))
-    creds = service_account.Credentials.from_service_account_info(info, scopes=scopes)
-else:
-    creds, _ = google.auth.default(scopes=scopes)
+creds = get_credentials(scopes)
 creds.refresh(Request())
 drive = build("drive", "v3", credentials=creds, cache_discovery=False)
 

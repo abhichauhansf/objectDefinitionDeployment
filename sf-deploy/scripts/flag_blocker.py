@@ -33,6 +33,8 @@ import subprocess
 import sys
 from pathlib import Path
 
+from sheet_config import add_spreadsheet_id_arg
+
 HERE = Path(__file__).resolve().parent
 REPORT_PATH = Path(".build/flag_blocker_report.json")
 
@@ -60,7 +62,7 @@ def run(cmd: list[str]) -> int:
 
 def main() -> int:
     ap = argparse.ArgumentParser(description="Flag a blocking field row: AH note + Col A highlight + report (coupled).")
-    ap.add_argument("--spreadsheet-id", required=True)
+    add_spreadsheet_id_arg(ap)
     ap.add_argument("--tab", required=True)
     ap.add_argument("--object", required=True, help="object API name, e.g. TI_Fnt_Deal__c (for AH row matching)")
     ap.add_argument("--blockers", default="", help="JSON list [{field, check, message, severity?}]")

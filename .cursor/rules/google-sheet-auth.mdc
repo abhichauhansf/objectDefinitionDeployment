@@ -1,0 +1,50 @@
+---
+description: Google Sheet authentication for sf-deploy scripts. All scripts get credentials from scripts/google_auth.py, which re-runs the gcloud browser login automatically when the login is missing or expired. Applies whenever a script reads or writes the Google Sheet.
+alwaysApply: true
+---
+
+<!-- Updated by Divakar N — 2026-10-19. Why: ADC expired, and re-logging in with
+`gcloud auth application-default login` gave 403 SERVICE_DISABLED (that client
+needs a quota project). The login below works without one. -->
+
+# Google Sheet Authentication (auto re-login)
+
+## One place for credentials
+
+Every sf-deploy script builds its Sheets/Drive client through
+`sf-deploy/scripts/google_auth.py` (`sheets_service()`, `sheets_service(write=True)`,
+`drive_service()`, `get_credentials()`). `fetch_sheet.get_sheets_service()` wraps
+it. New scripts must use these helpers; never call `google.auth.default()` directly.
+
+## What happens when the login has expired
+
+Before each run the helper refreshes the token. If credentials are missing,
+expired (`RefreshError` / "Reauthentication is needed"), or were created by
+`gcloud auth application-default login` without a quota project, it backs up
+`~/.config/gcloud/application_default_credentials.json` and runs:
+
+```
+gcloud auth login <account> --enable-gdrive-access --update-adc --force
+```
+
+A browser opens once; after sign-in the script continues on its own.
+`gcloud` lives at `~/google-cloud-sdk/bin/gcloud` (not on PATH); the helper finds it.
+
+## Agent behavior
+
+1. Run sheet scripts with `required_permissions: ["full_network"]` as usual.
+2. If a script stops with a Google auth error (`GoogleAuthError`, `RefreshError`,
+ 403 quota-project / `SERVICE_DISABLED`), do not stop the task. Run
+ `python scripts/google_auth.py` with `required_permissions: ["all"]` (the
+ login writes to `~/.config/gcloud` and opens a browser, which the sandbox
+ blocks), tell the user to finish the sign-in in the browser, then re-run the
+ original script.
+3. Quick health check: `python scripts/google_auth.py --check` (no login).
+ Force a fresh login: `python scripts/google_auth.py --login`.
+4. Do NOT use `gcloud auth application-default login` — it fails with 403
+ unless a quota project is set.
+5. `SF_DEPLOY_NO_AUTO_LOGIN=1` makes scripts fail instead of opening a browser
+ (for unattended runs). `GOOGLE_SERVICE_ACCOUNT_JSON`, if set, is used first
+ and never triggers a login.
+
+The Cursor Google Workspace MCP has its own login and is not affected.

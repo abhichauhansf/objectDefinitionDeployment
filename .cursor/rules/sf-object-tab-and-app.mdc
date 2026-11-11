@@ -23,6 +23,15 @@ control in its object-meta header block:
 - **`H6`** = the value: `TRUE` → create the CustomTab; `FALSE` or blank → SKIP tab
   creation for that object (deploy the object/fields only, no tab).
 
+<!-- Updated by Divakar N — 2026-10-12. Why: on ExportLetterOfCreditInfo the
+flag sits in G5/G6, not H5/H6, so reading H6 returned blank and the tab was
+wrongly skipped. -->
+The column is NOT fixed: locate the `タブ作成 (Create Tab)` label in the
+object-meta label row and read the cell directly beneath it (G6 on some tabs,
+H6 on others). `fetch_sheet.py` does this and returns it as `createTab`, and
+`attr_drift.py` reports `[object] CustomTab` drift when the flag is TRUE but
+the org has no tab. "H6" below means "the Create Tab value cell".
+
 Read `H6` **live** from the object's sheet tab (per the read-sheet-live rule)
 before deciding. `fetch_sheet.py` / `prep_deploy.py` surface this value; if it is
 missing, treat blank as `FALSE` (do not create a tab) and surface that to the user.

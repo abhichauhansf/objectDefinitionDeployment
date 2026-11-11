@@ -1,15 +1,44 @@
 ---
-description: Custom Salesforce field API names generated for this project must start with the namespace prefix TI_Fnt_ and end with __c. Applies to name_fields.py, finalize_names.py, generators, and any field-naming proposal or sheet write-back.
+description: Every custom Salesforce component we create for this project (fields, compact layouts, Lightning pages, permission sets, flows, apps, quick actions, etc.) must have an API name starting with TI_Fnt_. Custom field API names must also end with __c. Applies to name_fields.py, finalize_names.py, generators, copies/_v2 duplicates, and any naming proposal or sheet write-back.
 alwaysApply: true
 ---
 
-# Custom Field Namespace Prefix: TI_Fnt_ (MANDATORY)
+# TI_Fnt_ Prefix for EVERY Component We Create (MANDATORY)
 
-Every NEWLY GENERATED custom field API name in this project must use the form:
+<!-- Updated by Divakar N — 2026-10-08. Why: the rule only covered custom fields,
+so ERPPJ-1055 shipped compact layouts named Domestic_Compact_Layout_v2 /
+Import_Compact_Layout_v2 with no prefix and they had to be recreated as
+TI_Fnt_Domestic_Compact_Layout_v2 / TI_Fnt_Import_Compact_Layout_v2. The prefix
+now applies to every component we author, not only fields. -->
+
+## Scope: all NEW components we create
+
+Every NEW component whose API name / developer name we choose must start with
+`TI_Fnt_` (exact case — not `TI_FnT_`, `TI_FNT_`, or `TI_LOGI_`). This includes,
+non-exhaustively:
+
+| Component | Example |
+|-----|-----|
+| Custom field | `TI_Fnt_SalesOrganization__c` |
+| Custom object | `TI_Fnt_Receiving__c` |
+| Compact layout | `TI_Fnt_Domestic_Compact_Layout_v2` |
+| Lightning page (FlexiPage) | `TI_Fnt_Receiving_Record_Page_v2` |
+| Permission set / permission set group | `TI_Fnt_SalesFront_Access` |
+| Flow, Apex class / trigger / test, LWC / Aura bundle | `TI_Fnt_ReceivingSync` |
+| Quick action / button / custom button | `TI_Fnt_CreateOrderReport` |
+| Page layout, list view, record type, validation rule | `TI_Fnt_Import` |
+| Custom app, custom label, custom metadata type / record, report, dashboard, email template | `TI_Fnt_SalesFrontApp` |
+A copy of an existing component (a `_v2` duplicate for customer review) is a NEW
+component: it must carry the prefix even when the original does not (see
+rule 3 below for the original's own name).
+
+## Field names (unchanged)
+
+Every NEWLY GENERATED custom field API name must use the form:
 
     TI_Fnt_<Component>__c
 
-- Prefix: `TI_Fnt_` (exact case — not `TI_FnT_`, `TI_FNT_`, or `TI_LOGI_`).
+- Prefix: `TI_Fnt_`.
 - Suffix: `__c` (per the field-api-naming rule).
 - Example: `TI_Fnt_SalesOrganization__c`, `TI_Fnt_Incoterms__c`.
 
@@ -17,22 +46,46 @@ Every NEWLY GENERATED custom field API name in this project must use the form:
 
 1. Apply the prefix only ONCE — never `TI_Fnt_TI_Fnt_…`. If a component already
    begins with `TI_Fnt_`, do not add it again.
-2. Do NOT prefix or rename STANDARD fields (`Id`, `Name`, `OwnerId`,
-   `CreatedDate`, `custom == false`, etc.) — leave them untouched.
-3. Do NOT re-prefix fields that already exist in the org with a different, valid
-   API name; the prefix applies to fields we are naming for the first time.
-4. Length budget: the FULL name including `TI_Fnt_` (7) and `__c` (3) must be
-   <= 40 chars, so the component has ~30 chars. Shorten the component sensibly
-   (accepted abbreviations, drop filler) if it overflows — flag, never truncate
-   mid-word.
-5. Full name must match `^TI_Fnt_[A-Za-z][A-Za-z0-9]*__c$` and be unique within
-   the object (case-insensitive).
+2. Do NOT prefix or rename STANDARD components (`Id`, `Name`, `OwnerId`,
+   `CreatedDate`, `custom == false`, standard objects, standard actions such as
+   `View`, `Delete`, `Edit`, standard tabs, etc.) — leave them untouched.
+3. Do NOT re-prefix or rename components that already exist in the org with a
+   different, valid API name; the prefix applies to components we are naming for
+   the first time. For a `_v2` copy of an un-prefixed original, the ORIGINAL keeps
+   its name and the COPY gets the prefix, e.g. original `Domestic_Compact_Layout`
+   → copy `TI_Fnt_Domestic_Compact_Layout_v2`.
+4. Name derived by Salesforce, not chosen by us, is not renamed: a CustomTab takes
+   the object name (already `TI_Fnt_…__c`), a relationship name follows the field
+   name, a Layout is `<Object>-<Layout name>` (prefix the layout-name part), and
+   fields on standard objects keep their `__c` suffix rules.
+5. Length budget: respect each type's limit. For custom fields the FULL name
+   including `TI_Fnt_` (7) and `__c` (3) must be <= 40 chars, so the component
+   has ~30 chars. Other types: 80 chars for most developer names (compact
+   layouts, FlexiPages, flows, permission sets); Apex/LWC names have their own
+   limits. Shorten the component sensibly (accepted abbreviations, drop filler)
+   if it overflows — flag, never truncate mid-word.
+6. Pattern: developer names are letters/digits/underscores, start with a letter,
+   no trailing or double underscores. Custom field full name must match
+   `^TI_Fnt_[A-Za-z][A-Za-z0-9]*__c$` and be unique within the object
+   (case-insensitive). Other component names must match
+   `^TI_Fnt_[A-Za-z][A-Za-z0-9_]*$` and be unique within their type (and object,
+   where the type is object-scoped).
+7. **Check before deploy.** Whenever a generator, script or hand-written package
+   adds a NEW component, confirm its API name starts with `TI_Fnt_` BEFORE the
+   check-only dry-run. A deploy of a new component without the prefix is a miss:
+   rename it (Salesforce cannot rename compact layouts and several other types —
+   create the prefixed one, then remove the un-prefixed one, never touching the
+   originals).
+8. **Tell the customer the final names.** When a component name has been given to
+   the customer or written in a Jira comment, update the comment/draft whenever
+   the name changes.
 
 ## Note on existing conventions
 
-Some existing objects/fields in the org use other prefixes (`TI_Logi_`,
-`TI_STC_`) or none at all. This rule governs fields WE generate for this
-project; if a target object's existing fields follow a different convention,
+Some existing objects/components in the org use other prefixes (`TI_Logi_`,
+`TI_STC_`) or none at all (for example `Domestic_Compact_Layout`,
+`Import_Compact_Layout`). This rule governs components WE create for this
+project; if a target object's existing components follow a different convention,
 surface that to the user before applying, but default to `TI_Fnt_`.
 
 Writing names into the Google Sheet remains gated by the sheet-write

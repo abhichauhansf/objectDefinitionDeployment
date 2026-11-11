@@ -1,0 +1,29 @@
+---
+description: Rollup summary fields use column H (設定値), not G. Parse Operation/Child/Field/Condition with symbol operators into Salesforce summaryOperation/summaryForeignKey/summarizedField/summaryFilterItems. Blank H is a hard blocker. Use when the user mentions roll-up, rollup summary, Summary field, or column H rollup format.
+alwaysApply: false
+---
+
+<!-- Updated by Divakar N — 2026-09-23.
+     Why: Rollup summary must be defined in col H (設定値), same as formula /
+     picklist / referenceTo. Col G is description only. generate_xml used to
+     emit only <type>Summary</type>, so the field could not deploy.
+     Canonical H labels have no space after the colon (Operation:SUM). -->
+
+# Rollup summary = column H (設定値)
+
+Column **E** = `Rollup summary`. Setup is **only** in column **H**. Column **G** is description and is never read.
+
+Parser: `sf-deploy/scripts/rollup_h.py`. Blank H is a **hard blocker** (`summary.parse`). Do not inject a dummy roll-up. Extra `Condition:` lines are AND only.
+
+Canonical form: **no space after the colon** (`Operation:SUM`, not `Operation: SUM`). Spaces after the colon are still accepted.
+
+```text
+Operation:COUNT | SUM | MIN | MAX
+Child:ChildObject__c.MasterDetailField__c
+Field:ChildObject__c.FieldToSummarize__c
+Condition:ChildObject__c.FilterField__c <operator> <value>
+```
+
+- `Child:` required. `Field:` required for SUM/MIN/MAX; omit for COUNT.
+- Operators: `=` `!=` `<` `>` `<=` `>=` `~` `!~` `^=` `in` `!in`
+- Value: literal or `valueField:ChildObject__c.OtherField__c`

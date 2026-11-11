@@ -15,6 +15,15 @@ object we build a record page for, on BOTH page shapes:
 A section rendered as a single column is **non-compliant** and must be
 regenerated as two-column before (re)deploy.
 
+## Z-shaped field order (client request, ERPPJ-1055, 2026-10-09)
+
+Fields inside a two-column section must read in a **Z-shape** (row by row):
+`1 2 / 3 4 / 5 6` — the left column holds items 1, 3, 5 and the right column
+items 2, 4, 6. Do **not** use the N-shape (`1 4 / 2 5 / 3 6`, first half left,
+second half right). The generators split with `fields[c::ncols]`. The rule
+below that says "first half → left column" is superseded by this. Pages that
+already exist are not regenerated for this.
+
 ## Rules
 
 1. **Default = 2 columns per section.** Both page generators default to
@@ -32,9 +41,14 @@ regenerated as two-column before (re)deploy.
    `fieldSection` contains **two** `flexipage:column` blocks (e.g. grep the
    `.flexipage-meta.xml`). A multi-field section with only one column is a MISS —
    regenerate.
-5. **Applies retroactively.** Any record page previously generated as
-   single-column must be regenerated to two-column and redeployed when next
-   touched.
+5. **First create only.** Two columns apply when the page is generated on the
+   object's first deploy. A Lightning page that already exists is frozen on
+   later object-definition sheet deploys (`sf-post-deploy-fls-and-flexipage.mdc`
+   GATE 2) — do not regenerate it to fix columns. Unplacing an IsDelete field
+   before its delete is the only allowed edit, and it does not re-lay the page.
+
+<!-- Updated by Divakar N — 2026-10-05. Why: regenerating an existing page on a
+later sheet deploy overwrites the page created at first object deploy. -->
 
 ## Implementation (keep it wired)
 

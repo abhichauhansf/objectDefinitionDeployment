@@ -20,9 +20,45 @@ BLOCK or corrupt the deploy. This is the single most important gate; if Step 0
 is not clean (or explicitly accepted by the user), you do NOT proceed.
 
 Scan for blockers including (non-exhaustive):
-- Blank / missing Field API Name (`fullName`) on a custom-field row.
 - Blank required attributes for the field's type (e.g. `type`, picklist values,
   `length`/`precision`/`scale`, Lookup/Master-Detail `referenceTo`).
+  <!-- Updated by Divakar N -->
+  - **EXCEPTION — blank Field API Name (col D) is NOT a hard blocker.** A
+    custom-field row with an empty `fullName` must NOT be parked and must NOT
+    be flagged via `flag_blocker.py`. GDC owns `TI_Fnt_` names; the client
+    ships labels/types first. Generate `TI_Fnt_<Component>__c` (glossary first,
+    label-fallback if the object already exists), write it back to col D
+    (gated) plus an AH `[FIX]` note, then continue. See
+    `sf-field-api-naming.mdc` §0b. **Why:** treating blank col D as ERROR
+    parked whole new tabs (`TradeTermsAppDetail` 2026-09-21). Skip WIP /
+    IsDelete / standard rows — those are never named.
+  <!-- Updated by Divakar N — 2026-10-07 -->
+ - **EXCEPTION — blank English label is NOT a hard blocker.** A blank object,
+ Name-field, or custom-field `Field Label (EN)` is filled by the
+ `prep_deploy.py` translation step (JA → en_US, DeepL or Google). Report it
+ as pending translation; do not park it or `flag_blocker.py` it. The deploy
+ gate (`validate_sheet.py --require-en`, run by `prep_deploy.py` after
+ enrichment) still blocks if English is blank after translation.
+ <!-- Updated by Divakar N — 2026-10-07. Why: Receiving rows 55 and 98 were
+ parked only because their English labels were 48 and 55 characters. -->
+ - **EXCEPTION — English label over 40 characters is NOT a blocker.** It is a
+ WARN (`translation.length`). `prep_deploy.py` re-translates it with DeepL
+ to fit 40 characters and writes the result back to the sheet (gated, in the
+ translation batch). If DeepL cannot fit it, only that label's English is
+ left out of the translation package. The field still deploys. Do not park
+ it, `flag_blocker.py` it, or pink-highlight it. See
+ `sf-object-translation-deploy.mdc` step 3b.
+ <!-- Updated by Divakar N — 2026-10-26. Why: English labels are for GDC
+ developers only, not a client requirement. -->
+ - **English labels are internal (GDC developers only).** Never include
+ English-label items in client questions or Jira comments to the client;
+ report weak/unfitted English to the user only. See
+ `sf-object-translation-deploy.mdc` "Who the English labels are for".
+ - **EXCEPTION — Number/Currency/Percent size is column F, not T/U.** The
+    client writes `"integerDigits, scale"` in F (e.g. `"12, 3"` → Salesforce
+    precision 15, scale 3). Blank T (`精度`) / U (`スケール`) is NOT a blocker
+    when F is valid. Blank F **and** blank T/U still is. Do not write derived
+    precision/scale back to T/U (see `sf-numeric-size-column-f.mdc`).
   - **EXCEPTION — empty FORMULA body is NOT a hard blocker.** A Formula field
     whose formula body (col H) is blank must NOT be parked: Salesforce rejects an
     empty formula, so `generate_xml.py` AUTO-INJECTS a return-type-appropriate
@@ -31,9 +67,105 @@ Scan for blockers including (non-exhaustive):
     so the field stays deployable. The injected dummy is a deployment fix and is
     therefore subject to the MANDATORY attribute write-back (STEP 0 §3 /
     `write_attr_fixes.py`): write the dummy back into the field's col-H value cell
-    (gated) and note it in AH, so the sheet matches the org. The real formula is
-    supplied later by the client.
-- Missing `relationshipName` on a Lookup / Master-Detail row.
+ (gated) and note it in AH, so the sheet matches the org. The real formula is
+ supplied later by the client.
+ <!-- Updated by Divakar N — 2026-10-12. Why: on ExportLetterOfCreditInfo
+ row 63 the AH note speculated from col P that the formula should be a
+ roll-up summary; the user wants the placeholder rule applied as-is. -->
+ Decide only from col H: do not read other columns (e.g. col P notes) to
+ guess the formula or suggest a different field type, and do not mention
+ them in the AH note.
+  <!-- Updated by Divakar N — 2026-09-23. Why: Rollup summary setup is col H
+       (設定値), not G. Blank H cannot be dummy-filled (unlike formulas) because
+       Operation/Child/Field are a business decision. Previously generate_xml
+       wrote only <type>Summary</type> and the validator looked for columns that
+       do not exist on the Format tab. -->
+  - **Rollup summary — blank H IS a hard blocker.** Column E = `Rollup summary`.
+    The setup lives in col **H** (`設定値`) as labeled `Operation:COUNT` /
+    `Child:…` / `Field:…` / `Condition:…` lines — **no space after the colon**
+    (`scripts/rollup_h.py`). Empty or Japanese-prose
+    H must be parked via `flag_blocker.py` (`summary.parse`). Never invent a dummy
+    roll-up. Never read col G.
+  <!-- Updated by Divakar N — 2026-10-08. Why: the client confirmed col G is
+       a user-facing explanation the tool never reads; the 2026-10-05 col-G
+       fallback for lookups is removed. -->
+  - **Lookup / Master-Detail — col H only.** The lookup object
+    (`referenceTo`) is col **H** (`設定値`). Col G (`データ型に応じて…`) is
+    never read. Blank H is a blocker; ask the client to fill H.
+  <!-- Updated by Divakar N — 2026-10-08. Why: agreed with Yagai-san. Col H
+       header renamed `defaultValue` → `value`; col L is the default value;
+       col G is the customer view. -->
+  - **Picklist values — col H; blank H reads col G.** Col **H** (`value` /
+    `設定値`) holds the deployable `Label:ApiName;…` list; when filled it is
+    used as-is and G is ignored. Col **L** (`デフォルト値`) is the picklist
+    default (one value, matched to a label or API name). Col **G** is the
+    customer view (labels only): when H is blank, read the labels from G, run
+    `picklist_api.py` (DeepL) to generate English API names, and write the
+    `Label:ApiName` list to **col H** (gated) plus an AH `[FIX]` note.
+    `prep_deploy.py` stops while any picklist is still G-sourced, so H is
+ always written before deploy. Blank G and blank H (and no Global Value
+ Set) is a blocker. Half-width `;` and full-width `；` separate values.
+ <!-- Updated by Divakar N — 2026-10-21. Why: ERPPJ-1113 Class2 values
+ `棚卸差損：実額:AA4` collapsed into duplicate labels; the org keeps `：`. -->
+ A full-width `：` separates label and API name only when the value has
+ no half-width `:`; otherwise it is label text (`棚卸差損：実額:AA4` →
+ label `棚卸差損：実額`, API `AA4`; `picklist_api.split_entry`).
+ <!-- Updated by Divakar N — 2026-10-21. Why: SIE Class2 dry-run
+ Duplicate label 販売員手数料：単価 — sheet DW5 vs org BHB. -->
+ When the field already exists, a sheet ApiName that differs from the org
+ ApiName for the SAME label is an ERROR (`picklist.org_api`). Salesforce
+ cannot rename picklist `fullName`s. Keep the org ApiName, write it back
+ to col H (`picklist_api.resolve_against_org`), and add only new labels.
+ <!-- Updated by Divakar N — 2026-10-26. Why: line breaks between picklist
+ values in col H are now allowed; generate_xml already split on them, only
+ validate_sheet and the sheet input validation rejected them. -->
+ A line break separates values exactly like `;` (one value per line is
+ fine; `picklist_api.split_values`). Lookups do NOT fall back to G (col H only).
+  <!-- Updated by Divakar N — 2026-10-12. Why: QuoteLineItemBreakdown rows
+       20–22 had labels-only Japanese values in a filled col H, and row 23 had
+       `ApiName:Label` reversed; neither case was described here. -->
+  - **Picklist values with no API name in a filled col H.** A Japanese
+    value with no `:ApiName` (e.g. `三軸シャーシ;指定なし`) is NOT a blocker:
+    `validate_sheet.py` only WARNs (`picklist.nonascii_api`), but
+    `prep_deploy.py` step 2b stops the deploy until it is named. Handle it
+    exactly like a G-sourced picklist: run `picklist_api.py --rows <json>
+    --org <ORG>` (DeepL), preview, then write the `Label:ApiName` list to
+    col H (gated) plus an AH `[FIX]` note. Values already in the org reuse
+    the org API name; values already `Label:ApiName` are kept.
+    - **Leading digit:** the script prefixes `V` when a generated name would
+      start with a digit (`2t` → `V2t`).
+    - **Already-ASCII values** that are not plain letters/digits (`20FT`,
+      `DG+RF`) are proposed for renaming (`V20FT`, `DGRF`) but do not block
+      `prep_deploy.py`. Leave them as the client wrote them unless the user
+      asks; the check-only dry-run confirms the org accepts them.
+    - **Bad translation:** review DeepL's English before writing. A wrong
+      name (e.g. 通常 → `Usually…` instead of `Standard…`) may be corrected
+      by hand with the user's approval; say so in the AH note.
+  - **Reversed `ApiName:Label` in col H is an ERROR (`picklist.reversed`).**
+    The part before the first `:` is always the label. If H reads
+    `SeaBaseFreight:海上BASE FREIGHT(入力用)` (English code first, Japanese
+    after), the org would get English labels and Japanese API names.
+    `validate_sheet.py` flags any value whose label is a plain code and whose
+    API name is non-ASCII. Fix by swapping each pair in col H (gated) plus an
+    AH `[FIX]` note; do not `flag_blocker.py` it when the swap is the fix. Col G may legitimately use
+    `ApiName：Label` (its header says `API参照名：ラベル名`); H must not.
+- Missing `relationshipName` on a Lookup / Master-Detail row **only when col H
+  (`設定値` / referenceTo) is blank.** If col X is blank but col H has the
+  lookup object, that is NOT a blocker:
+  - field already in the org → write back the org's `relationshipName` to col X
+    (never invent a new child-relationship name on an existing field). The org
+    value is read live (`readMetadata`, FLS-independent) by `validate_sheet.py
+    --target-org` and used by `generate_xml.py`; a filled col X that differs
+    from the org is a WARN and the org value is kept. If the org cannot be
+    read, blank X is an ERROR — never fall back to deriving;
+  - new field → auto-fill from the field API (minus `__c`; object-scoped for
+    shared parents like User) via `relname.derive_relationship_name`, write it
+    back to col X, and proceed. Length shortening and Fnt/Logi qualifying also
+    apply to new fields only.
+  <!-- Updated by Divakar N — 2026-10-06. Why: the generator always derived X,
+       even for fields already in the org. -->
+  - `fill_relationship_name.py --target-org <ORG>` writes back with the same
+    split (org value for existing fields, derived for new ones).
 - API names violating `sf-field-api-naming.mdc` / `sf-field-namespace-prefix.mdc`
   (bad pattern, `> 40` chars, missing `__c`, wrong/duplicated prefix).
 - Duplicate API names within the object (case-insensitive collisions).
@@ -56,10 +188,10 @@ blocker set. Then:
    while its AH note was written):
    ```
    # single field
-   python scripts/flag_blocker.py --spreadsheet-id <ID> --tab <Tab> \
+   python scripts/flag_blocker.py --tab <Tab> \
        --object <Obj>__c --field <API>__c --check <check> --message "<why>"   # +--apply
    # many fields
-   python scripts/flag_blocker.py --spreadsheet-id <ID> --tab <Tab> \
+   python scripts/flag_blocker.py --tab <Tab> \
        --object <Obj>__c --blockers <json:[{field,check,message,severity?}]>   # +--apply
    ```
    It internally calls `write_ai_comments.py` (AH) and `highlight_blockers.py`
@@ -142,8 +274,18 @@ and deploy ONLY the new (and, if explicitly requested, changed) fields.
    ```
    It reads the org's ACTUAL metadata via the Metadata API `readMetadata`
    (FLS-independent) and compares, per field, **type, formula, referenceTo,
-   picklist values, length, visibleLines, precision, scale, required, unique, and
-   externalId** (and flags any unmapped Data Type). It writes
+   picklist values, roll-up summaryOperation/foreignKey/summarizedField/filters,
+   <!-- Updated by Divakar N — 2026-09-23: name-existence is not definition-match for roll-ups -->
+ length, visibleLines, precision, scale, required, unique, and
+ externalId** (and flags any unmapped Data Type).
+ <!-- Updated by Divakar N — 2026-10-12. Why: object settings and the Create
+ Tab flag were never compared on existing objects. -->
+ It also compares the object settings `enableReports`, `enableActivities`,
+ `enableHistory`, `enableSearch` (blank on the sheet = false) and, when the
+ Create Tab flag is TRUE, whether the CustomTab exists (`[object] …` rows).
+ These are report-only: deploy an object-setting change from a fresh org
+ copy of the CustomObject with only that setting changed, never from the
+ generator's minimal object file. It writes
    `.build/attr_drift_<Obj>.json`. `prep_deploy.py` runs this automatically in its
    build phase (step 6b). SURFACE any drift to the user. Redeploying drift is a
    user decision, not automatic — many type changes (Lookup↔Formula,
@@ -199,13 +341,26 @@ package; `build_destructive.py` handles the actual deletion:
 
 1. **Scan + build (safe, no writes):**
    ```
-   python scripts/build_destructive.py --spreadsheet-id <ID> \
+   python scripts/build_destructive.py \
        --tabs "<tab1>,<tab2>" --target-org "<ORG>"
    ```
    It skips WIP rows, requires a valid custom Field API Name, and with
    `--target-org` verifies each field EXISTS in the org (Tooling API) — fields
    already absent are dropped as no-ops. It writes `manifest/destructiveChanges.xml`
    (CustomField members `<Obj>__c.<Field>__c`) + an empty `manifest/destructive_package.xml`.
+   <!-- Updated by Divakar N — 2026-10-06. Why: Salesforce refuses to delete a
+        field that a Lightning page still places. -->
+   With `--target-org` it also scans the org's FlexiPages and exits **2
+   (BLOCKED)** if a field to delete is still placed on a Lightning page.
+1b. **Unplace from the Lightning page first (the ONE page-freeze exception).**
+   Lightning pages are otherwise frozen after first object create
+   (`sf-post-deploy-fls-and-flexipage.mdc` GATE 2). For each blocked field:
+   retrieve the listed FlexiPage(s) from the org, remove ONLY the
+   `fieldInstance` entries for the IsDelete field(s) (`Record.<Field>__c`), and
+   deploy the page through `deploy.py` (dry-run, then `--start`). Change nothing
+   else on the page — no regeneration, no other field, section, or tab edits,
+   and no `actionOverrides` change. Confirm the page live, then re-run step 1.
+   Report per page which fields were unplaced.
 2. **Review** the printed delete set with the user — deletion is irreversible and
    also destroys the field's data.
 3. **Delete for real (DESTRUCTIVE):**

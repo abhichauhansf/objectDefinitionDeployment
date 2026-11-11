@@ -90,6 +90,12 @@ def read_org_fields(api, tok, inst, ver):
         name = d.get("fullName", "")
         if not name:
             continue
+        # Updated by Divakar N — 2026-09-23. Why: readMetadata(CustomObject) on
+        # standard objects (Account) returns Name/OwnerId/Person* etc. Those
+        # cannot carry FieldPermissions (restricted picklist) and poisoned the
+        # Account roll-up FLS grant. Only custom (__c) fields are grantable.
+        if not name.endswith("__c"):
+            continue
         fields[name] = {
             "type": d.get("type", ""),
             "required": d.get("required", "").lower() == "true",

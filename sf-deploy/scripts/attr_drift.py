@@ -30,6 +30,11 @@ import argparse, json, os, re, subprocess, sys, urllib.request, urllib.error
 import xml.etree.ElementTree as ET
 from pathlib import Path
 
+from sheet_config import add_spreadsheet_id_arg
+from numeric_size import apply_numeric_size
+from rollup_h import apply_rollup_h, parse_rollup_h  # Updated by Divakar N — 2026-09-23
+from picklist_api import parse_entries
+
 # sheet "Data Type" -> (expected org base type, is_formula).
 # Keys are matched case-insensitively and after light normalization (see norm_dt).
 _RAW_SHEET_MAP = {
@@ -89,6 +94,9 @@ def load_token(org: str | None, token_file: str) -> dict:
     return a
 
 
+OBJECT_FLAGS = ("enableReports", "enableActivities", "enableHistory", "enableSearch")
+
+
 def read_org_object(api: str, tok: str, inst: str, ver: str) -> dict | None:
     """readMetadata(CustomObject) -> {fieldFullName: {type, formula, referenceTo, _picklist}}."""
     soap = (
@@ -114,10 +122,23 @@ def read_org_object(api: str, tok: str, inst: str, ver: str) -> dict | None:
         return None  # object absent in org
     org = {}
     for f in root.iter("fields"):
-        d = {c.tag: (c.text or "") for c in f}
+        d = {c.tag: (c.text or "") for c in f if c.tag != "summaryFilterItems"}
         vals = [v.findtext("fullName", "") for v in f.iter("value")]
         if vals:
             d["_picklist"] = [x for x in vals if x]
+        # Updated by Divakar N — 2026-09-23.
+        # Why: a name-only / type-only drift check misses filter/operation edits
+        # on an existing Summary field (same gap as formula-body drift).
+        filters = []
+        for fi in f.findall("summaryFilterItems"):
+            filters.append({
+                "field": (fi.findtext("field") or "").strip(),
+                "operation": (fi.findtext("operation") or "").strip(),
+                "value": (fi.findtext("value") or "").strip(),
+                "valueField": (fi.findtext("valueField") or "").strip(),
+            })
+        if filters:
+            d["_summaryFilters"] = filters
         org[d.get("fullName", "")] = d
     # capture the standard Name field (nameField block on the CustomObject) so the
     # drift check can compare it too — it is NOT under <fields> and would otherwise
@@ -129,6 +150,7 @@ def read_org_object(api: str, tok: str, inst: str, ver: str) -> dict | None:
             "displayFormat": nf.findtext("displayFormat", "") or "",
             "label": nf.findtext("label", "") or "",
         }
+    org["__objectFlags__"] = {k: rec.findtext(k, "") or "" for k in OBJECT_FLAGS}
     return org
 
 
@@ -137,7 +159,7 @@ def main() -> int:
     ap.add_argument("--object", required=True, help="object API name, e.g. TI_Fnt_Deal__c")
     ap.add_argument("--rows", help="pre-fetched fetch_sheet JSON (skip live fetch)")
     ap.add_argument("--tab", help="sheet tab (for live fetch when --rows absent)")
-    ap.add_argument("--spreadsheet-id")
+    add_spreadsheet_id_arg(ap)
     ap.add_argument("--org", help="alias/username to mint a live session token")
     ap.add_argument("--token-file", default=".build/orgauth.json")
     ap.add_argument("--out", default=".build/attr_drift.json")
@@ -148,8 +170,8 @@ def main() -> int:
     if args.rows:
         rows = json.load(open(args.rows))
     else:
-        if not (args.tab and args.spreadsheet_id):
-            sys.exit("❌ need --rows OR (--tab and --spreadsheet-id)")
+        if not args.tab:
+            sys.exit("❌ need --rows OR --tab (spreadsheet defaults to sheet_config.py)")
         subprocess.run(["python3", "scripts/fetch_sheet.py", "--spreadsheet-id", args.spreadsheet_id,
                         "--tabs", args.tab, "--out", ".build/_attr_rows.json"], check=True)
         rows = json.load(open(".build/_attr_rows.json"))
@@ -182,8 +204,8 @@ def main() -> int:
             return int(float(s))
         except Exception:
             return s
-    def _sbool(v):  # sheet truthiness (TRUE/x/yes/1)
-        return str(v or "").strip().lower() in ("true", "x", "yes", "1")
+    def _sbool(v):  # sheet truthiness — must match generate_xml.is_truthy
+        return str(v or "").strip().lower() in ("true", "x", "yes", "1", "○", "〇")
     def _obool(v):  # org metadata boolean
         return str(v or "").strip().lower() == "true"
 
@@ -195,7 +217,7 @@ def main() -> int:
         tsv = (r.get("Type Specific Value") or "").strip()
         om = org.get(api)
         if om is None:
-            drift.append({"field": api, "sheet": dt, "org": "(absent)",
+            drift.append({"field": api, "sheet": dt, "org": "(absent)", "action": "create",
                           "reason": "field not in org (not yet deployed)"})
             continue
         exp_base, exp_formula, mapped = map_dt(dt)
@@ -224,13 +246,48 @@ def main() -> int:
                 why.append(f"formula body differs (org={_of[:30]!r})")
         if exp_base in ("Lookup", "MasterDetail") and tsv and oref and oref != tsv:
             why.append(f"referenceTo: sheet={tsv} org={oref}")
+        if exp_base == "Summary":
+            # Updated by Divakar N — 2026-09-23.
+            # Why: "exists in org" is not "matches the sheet" for roll-ups.
+            apply_rollup_h(r)
+            parsed = r.get("_rollup") or parse_rollup_h(tsv)
+            if parsed.get("ok"):
+                def _lc(x):
+                    return str(x or "").strip().lower()
+                sop = _lc(om.get("summaryOperation"))
+                sheet_op = _lc(parsed["operation"])
+                # org may be Count/count/COUNT
+                if sheet_op and sop and sheet_op != sop:
+                    why.append(f"summaryOperation: sheet={parsed['operation']} org={om.get('summaryOperation')}")
+                sfk, ofk = parsed.get("child") or "", om.get("summaryForeignKey") or ""
+                if sfk and ofk and sfk != ofk:
+                    why.append(f"summaryForeignKey: sheet={sfk} org={ofk}")
+                ssum, osum = parsed.get("summarized_field") or "", om.get("summarizedField") or ""
+                if (ssum or osum) and ssum != osum:
+                    why.append(f"summarizedField: sheet={ssum or '(none)'} org={osum or '(none)'}")
+                def _fnorm(items):
+                    out = []
+                    for it in items or []:
+                        out.append((
+                            _lc(it.get("field")),
+                            _lc(it.get("operation")),
+                            it.get("valueField") or it.get("value") or "",
+                            "vf" if it.get("valueField") else "v",
+                        ))
+                    return out
+                sf = _fnorm(parsed.get("filters"))
+                of = _fnorm(om.get("_summaryFilters"))
+                if sf != of:
+                    why.append(f"summaryFilterItems: {len(sf)} sheet / {len(of)} org")
+            elif tsv:
+                why.append("sheet rollup H did not parse — cannot compare summary attributes")
         if exp_base in ("Picklist", "MultiselectPicklist") and om.get("_picklist"):
             # Normalize full-width JP punctuation (；->; ：->:) exactly like
             # generate_xml before splitting entries on ';'/newline, then take the
             # API side (after the label:api colon) — the org fullName IS the api
             # side, so comparing the label kept it perpetually "drifted".
-            _tsv = tsv.translate({0xFF1B: ord(";"), 0xFF1A: ord(":")})
-            sv = [p.split(":")[-1].strip() for p in re.split(r"[;\n]", _tsv) if p.strip()]
+            # '\:' is a literal colon inside a label (parse_entries, as generate_xml).
+            sv = [api or label for label, api in parse_entries(tsv)]
             if sv and set(sv) != set(om["_picklist"]):
                 why.append(f"picklist values differ ({len(sv)} sheet / {len(om['_picklist'])} org)")
         # --- secondary attributes (only when the sheet specifies a value) ---
@@ -241,10 +298,12 @@ def main() -> int:
             svl, ovl = _num(r.get("Visible Lines")), _num(om.get("visibleLines"))
             if svl is not None and ovl is not None and svl != ovl:
                 why.append(f"visibleLines: sheet={svl} org={ovl}")
-        if exp_base in ("Number", "Currency", "Percent") and not exp_formula:
+        if exp_base in ("Number", "Currency", "Percent"):
+            apply_numeric_size(r)
             sp, op = _num(r.get("Precision")), _num(om.get("precision"))
             ssc, osc = _num(r.get("Scale")), _num(om.get("scale"))
-            if sp is not None and op is not None and sp != op:
+            # Salesforce stores every formula Number/Currency/Percent at precision 18.
+            if sp is not None and op is not None and sp != op and not exp_formula:
                 why.append(f"precision: sheet={sp} org={op}")
             if ssc is not None and osc is not None and ssc != osc:
                 why.append(f"scale: sheet={ssc} org={osc}")
@@ -258,7 +317,16 @@ def main() -> int:
                 why.append(f"{ocol}: sheet={_sbool(sv)} org={_obool(om.get(ocol))}")
         if why:
             od = ot + (" +formula" if ohf else "") + (f" ->{oref}" if oref else "")
-            drift.append({"field": api, "sheet": dt, "org": od, "reason": "; ".join(why)})
+            # Salesforce rejects formula<->non-formula in place ("Cannot update a
+            # field from a Formula to something else"); other type changes may too.
+            if exp_formula != ohf:
+                action = "recreate"
+            elif ot != exp_base:
+                action = "check"
+            else:
+                action = "update"
+            drift.append({"field": api, "sheet": dt, "org": od, "action": action,
+                          "reason": "; ".join(why)})
         else:
             insync += 1
 
@@ -267,8 +335,11 @@ def main() -> int:
     # and is not a __c custom field, so the custom-field loop above never sees it.
     # This is exactly how Receiving/ReceivingDetail shipped Name=Text while the sheet
     # declared AutoNumber. Compare it explicitly, every run.
-    meta = next((r for r in rows if (r.get("Name Field Type") or r.get("Name Field Display Format")
-                                     or str(r.get("_type") or "").lower() == "object")), None)
+    # Multi-tab rows files hold one object-meta row per object; take this object's.
+    meta = next((r for r in rows
+                 if str(r.get("Object API Name") or "").replace("__c", "") in ("", obj_norm)
+                 and (r.get("Name Field Type") or r.get("Name Field Display Format")
+                      or str(r.get("_type") or "").lower() == "object")), None)
     onf = org.get("__nameField__")
     if meta is not None and onf is not None:
         s_nt_raw = (meta.get("Name Field Type") or "").strip()
@@ -294,15 +365,43 @@ def main() -> int:
     elif onf is None:
         print("⚠️  org CustomObject returned no <nameField> — Name drift NOT checked.")
 
+    # Updated by Divakar N — 2026-10-12. Why: on an existing object the
+    # pipeline relabels from the org definition, so object settings and the
+    # Create Tab flag were never pushed or compared (ExportLetterOfCreditInfo
+    # had enableHistory=TRUE / Create Tab=TRUE on the sheet, neither in the org).
+    # Report only: switching a setting off can drop data (e.g. field history).
+    oflags = org.get("__objectFlags__") or {}
+    if meta is not None:
+        for k in OBJECT_FLAGS:
+            s, o = _sbool(meta.get(k)), _obool(oflags.get(k))
+            if s != o:
+                drift.append({"field": f"[object] {k}", "sheet": str(s), "org": str(o),
+                              "action": "update",
+                              "reason": "OBJECT setting; blank on the sheet = false"})
+            else:
+                insync += 1
+        if _sbool(meta.get("createTab")):
+            from audit_lib import read_customtab
+            if read_customtab(args.object, a) is None:
+                drift.append({"field": "[object] CustomTab", "sheet": "Create Tab=TRUE",
+                              "org": "(no tab)", "action": "create",
+                              "reason": "Create Tab flag is TRUE but the org has no tab; "
+                                        "create it and grant visibility (grant_tab_visibility.py)"})
+            else:
+                insync += 1
+        elif "createTab" not in meta:
+            print("⚠️  object-meta has no 'createTab' — re-fetch with the current fetch_sheet.py; "
+                  "tab existence NOT checked.")
+
     drift.sort(key=lambda d: d["field"])
     print("=" * 96)
     print(f"ATTRIBUTE DRIFT — {args.object}   (in-sync: {insync}   drifted: {len(drift)})")
     print("=" * 96)
     if drift:
-        print(f"{'FIELD':<44}{'SHEET':<16}{'ORG':<24}REASON")
-        print("-" * 96)
+        print(f"{'FIELD':<44}{'SHEET':<16}{'ORG':<24}{'ACTION':<10}REASON")
+        print("-" * 106)
         for d in drift:
-            print(f"{d['field']:<44}{d['sheet']:<16}{d['org']:<24}{d['reason']}")
+            print(f"{d['field']:<44}{d['sheet']:<16}{d['org']:<24}{d.get('action', ''):<10}{d['reason']}")
     else:
         print("  ✅ every existing field matches the sheet definition.")
     json.dump(drift, open(args.out, "w"), indent=2, ensure_ascii=False)
